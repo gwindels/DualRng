@@ -191,7 +191,7 @@ class Plotter:
 
             ax.set_ylabel(scale_name)
             ax.set_ylim(-1.05, 1.05)
-            ax.legend(loc='upper right', fontsize='small')
+            ax.legend(loc='upper left', fontsize='small')
             self._apply_date_axis(ax)
 
         axes[-1].set_xlabel("Time")
@@ -234,7 +234,7 @@ class Plotter:
                           label="Significant (FDR < 0.05)")
 
             ax.set_ylabel(scale_name)
-            ax.legend(loc='upper right', fontsize='small')
+            ax.legend(loc='upper left', fontsize='small')
             self._apply_date_axis(ax)
 
         axes[-1].set_xlabel("Time")
@@ -284,7 +284,7 @@ class Plotter:
                 ax.axhline(y=lower, color=color, linestyle="--", linewidth=1, label=label)
 
             ax.set_ylabel(scale_name)
-            ax.legend(loc='upper right', fontsize='small')
+            ax.legend(loc='upper left', fontsize='small')
             self._apply_date_axis(ax)
 
         axes[-1].set_xlabel("Time")
