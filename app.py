@@ -118,20 +118,23 @@ class CoherenceAnalyzer:
                     print("\nProcess interrupted. Closing connection.")
                     break  # Exit loop on Ctrl+C
             
-            # Collect, combine, and save all current session data
-            self.session_data = [{
-                'timestamps': timestamps[i], 
-                'z_scores_1': z_scores_1[i], 
-                'z_scores_2': z_scores_2[i], 
-                'stouffers_z': stouffers_z[i], 
-                'nvar': nvar[i],
-                'svar': svar[i]
-            } for i in range(len(z_scores_1))] # merge arrays into session_data
-            self.data_saver.save_session_data(self.session_data) # save to csv
-
         except Exception as e:
             print(f"Analysis Error: {e}")
         finally:
+            # Save whatever was collected, even if the loop raised or was stopped early
+            n = min(len(z_scores_1), len(z_scores_2), len(stouffers_z), len(nvar), len(svar), len(timestamps))
+            self.session_data = [{
+                'timestamps': timestamps[i],
+                'z_scores_1': z_scores_1[i],
+                'z_scores_2': z_scores_2[i],
+                'stouffers_z': stouffers_z[i],
+                'nvar': nvar[i],
+                'svar': svar[i]
+            } for i in range(n)]
+            try:
+                self.data_saver.save_session_data(self.session_data)
+            except Exception as e:
+                print(f"Failed to save session data: {e}")
             self.rng.close()
 
         return np.array(z_scores_1), np.array(z_scores_2), timestamps, np.array(nvar)
@@ -396,7 +399,8 @@ def graceful_shutdown(analyzer, analysis_thread=None):
     try:
         analyzer.stop()  # sets _stop_flag so long loops exit
         if analysis_thread and analysis_thread.is_alive():
-            analysis_thread.join(timeout=5.0)
+            # Wait for the worker to finish its current update and save the session
+            analysis_thread.join(timeout=60.0)
     finally:
         # If GUI is being used, stop it (this calls SineGUI._close_display())
         if getattr(analyzer, "gui_mode", False) and hasattr(analyzer, "gui"):
@@ -415,8 +419,14 @@ def graceful_shutdown(analyzer, analysis_thread=None):
                 pass
 
 def _signal_handler(signum, frame, analyzer_ref=None, analysis_thread_ref=None):
+    # Ask the worker and the GUI loop to stop; the main thread's finally block
+    # then runs graceful_shutdown once.
     if analyzer_ref:
-        self.graceful_shutdown(analyzer_ref, analysis_thread_ref)
+        analyzer_ref.stop()
+        if getattr(analyzer_ref, "gui_mode", False) and hasattr(analyzer_ref, "gui"):
+            analyzer_ref.gui.running = False
+        else:
+            raise KeyboardInterrupt
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run script in CLI or GUI mode")

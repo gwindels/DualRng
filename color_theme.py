@@ -1,5 +1,3 @@
-from typing import Self
-
 class ColorTheme:
     def __init__(self):
         self.system = {

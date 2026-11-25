@@ -18,6 +18,7 @@ class SineGUI:
         self.fps = fps
         self.double_tap_ms = 300      # max gap between taps
         self._last_tap_ts = 0
+        self._closed = False          # set once the display has been shut down
 
         self.on_start_trial = None  # callback
         self.is_idle = True
