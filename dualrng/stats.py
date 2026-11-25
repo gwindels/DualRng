@@ -89,7 +89,7 @@ def _assignments(a_obs: np.ndarray, exact_limit: int, n_perm: int, seed: int):
     return a_obs[idx].astype(float), "monte_carlo", n_perm
 
 
-def _p_values(t_obs: float, T: np.ndarray, method: str) -> dict:
+def _p_values(t_obs: float, T: np.ndarray, method: str, tail: str) -> dict:
     tol = 1e-9 * (abs(t_obs) + float(np.std(T)) + 1e-300)
     gt = int(np.sum(T > t_obs + tol))
     lt = int(np.sum(T < t_obs - tol))
@@ -98,18 +98,27 @@ def _p_values(t_obs: float, T: np.ndarray, method: str) -> dict:
         m = len(T)
         p_greater = (gt + eq) / m
         p_less = (lt + eq) / m
-        p_mid = (gt + 0.5 * eq) / m
     else:
         m = len(T) + 1  # the observed assignment counts as one permutation
         p_greater = (gt + eq + 1) / m
         p_less = (lt + eq + 1) / m
-        p_mid = (gt + 0.5 * eq + 0.5) / m
     p_two = min(1.0, 2 * min(p_greater, p_less))
-    p_mid = min(max(p_mid, 0.5 / m), 1 - 0.5 / m)
     return {"p_greater": p_greater, "p_less": p_less, "p_two_sided": p_two,
-            # Normal-equivalent of the permutation result: positive when the
-            # statistic is high. Used for combining sessions (Stouffer).
-            "z": float(sps.norm.isf(p_mid))}
+            "z": z_from_p(p_greater, p_less, p_two, tail, m)}
+
+
+def z_from_p(p_greater: float, p_less: float, p_two: float, tail: str, m: int) -> float:
+    """Normal equivalent of the session's own p-value, signed so that a high
+    statistic gives a positive z. Converting back with the same tail returns
+    the session's p exactly, so the ledger z and p always agree. Used for
+    combining sessions (Stouffer)."""
+    lo, hi = 0.5 / m, 1 - 0.5 / m  # keep z finite at the ends of the permutation distribution
+    if tail == "greater":
+        return float(sps.norm.isf(min(max(p_greater, lo), hi)))
+    if tail == "less":
+        return float(-sps.norm.isf(min(max(p_less, lo), hi)))
+    sign = 1.0 if p_greater <= p_less else -1.0
+    return float(sign * sps.norm.isf(min(max(p_two / 2, lo / 2), 0.5)))
 
 
 def select_p(pv: dict, tail: str) -> float:
@@ -146,7 +155,7 @@ def intention_test(bs: BlockSums, tail: str = "greater", exact_limit: int = 2000
     t_obs = float(stat(a_obs[None, :])[0])
     seed = secrets.randbits(63) if seed is None else seed
     A, method, m = _assignments(a_obs, exact_limit, n_perm, seed)
-    pv = _p_values(t_obs, stat(A), method)
+    pv = _p_values(t_obs, stat(A), method, tail)
 
     lean = lean_estimates(bs)
     pq = lean["pooled"] * (1 - lean["pooled"])
@@ -206,8 +215,8 @@ def connection_test(bs: BlockSums, tail: str = "two-sided", exact_limit: int = 2
     seed = secrets.randbits(63) if seed is None else seed
     A, method, m = _assignments(a_obs, exact_limit, n_perm, seed)
     T, NV, _ = _connection_stats(A, a)
-    pv = _p_values(t_obs, T, method)
-    pv_nv = _p_values(nv_obs, NV, method)
+    pv = _p_values(t_obs, T, method, tail)
+    pv_nv = _p_values(nv_obs, NV, method, "greater")
 
     cC, cR = float(a_obs @ a.count), float((1 - a_obs) @ a.count)
     return {

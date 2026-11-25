@@ -135,3 +135,16 @@ def test_stopped_session_uses_only_completed_blocks():
     res = analyze_arrays(cfg, reads, plan, stop_time=stop)
     used = [b["index"] for b in res["blocks"] if b["used"]]
     assert used == list(range(9))
+
+
+@pytest.mark.parametrize("kind", ["intention", "connection"])
+def test_ledger_z_converts_back_to_session_p(kind):
+    from dualrng.ledger import _p_for
+    cfg = small_config(kind, blocks_per_label=4)  # few blocks: coarse permutation distribution
+    rng = np.random.default_rng(17)
+    for _ in range(20):
+        model = SimModel(lean=HW_LEAN, intention_delta=3e-3, shared_rho=0.2)
+        reads, plan = simulate_session(cfg, model, READS_PER_SECOND, rng)
+        p = analyze_arrays(cfg, reads, plan, seed=1)["primary"]
+        if p["p"] < 1 - 1e-9:
+            assert _p_for(p["z"], p["tail"]) == pytest.approx(p["p"], rel=1e-9)
