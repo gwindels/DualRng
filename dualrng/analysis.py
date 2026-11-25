@@ -138,20 +138,21 @@ def ledger_row(session_id: str, meta: dict, config: ProtocolConfig, result: dict
     }
 
 
-def exploratory(config: ProtocolConfig, reads: dict, plan: list, read_seconds: float) -> dict:
+def exploratory(config: ProtocolConfig, reads: dict, plan: list, read_seconds: float,
+                seed: int | None = None) -> dict:
     from .scan import run_scan
 
     x1 = reads["ones1"] / reads["n"]
     x2 = reads["ones2"] / reads["n"]
     if config.session_type == "connection":
         return run_scan("connection", x1, x2, config.scan_windows_seconds, read_seconds,
-                        n_shifts=config.scan_shifts, t=reads["t_start"])
+                        n_shifts=config.scan_shifts, seed=seed, t=reads["t_start"])
     aim = np.zeros(len(x1))
     for b in plan:
         m = (reads["t_start"] >= b["start"]) & (reads["t_end"] <= b["end"])
         aim[m] = 1.0 if b["label"] == "HIGH" else (-1.0 if b["label"] == "LOW" else 0.0)
     return run_scan("intention", (x1 + x2) / 2, aim, config.scan_windows_seconds, read_seconds,
-                    n_shifts=config.scan_shifts, t=reads["t_start"])
+                    n_shifts=config.scan_shifts, seed=seed, t=reads["t_start"])
 
 
 def finalize_session(session_dir: str, ledger_path: str | None, run_exploratory: bool = True,

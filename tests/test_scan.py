@@ -21,7 +21,7 @@ def scan_ps(kind, model, n, seed):
     ps = []
     for _ in range(n):
         reads, plan = simulate_session(c, model, RPS, rng)
-        ex = exploratory(c, reads, plan, 1 / RPS)
+        ex = exploratory(c, reads, plan, 1 / RPS, seed=int(rng.integers(2**62)))
         ps.append(ex["p_scan"])
     return np.array(ps)
 
@@ -60,3 +60,23 @@ def test_scan_uses_full_windows_only():
     res = run_scan("connection", x, x[::-1].copy(), (1, 5, 50, 500), 1.0, n_shifts=9, seed=0)
     assert max(res["windows_reads"]) <= 50
     assert min(res["windows_reads"]) >= 2
+
+
+def test_connection_scan_ignores_constant_coupling():
+    """The TrueRNGproV2 probe showed a small steady coupling between the two
+    generators' LSBs (r ~ -0.011). A coupling that is the same all session long
+    is not a local event, and must not make ordinary sessions look unusual."""
+    rng = np.random.default_rng(41)
+    model = SimModel(lean=(0.4834, 0.5030), shared_rho=-0.05, shared_labels=("",))
+    n, sims = 10000, 150
+    labels = np.array([""] * n, dtype=object)
+    ps = []
+    for i in range(sims):
+        p1, p2 = model.p_for_reads(labels, 1024, rng)
+        x1 = rng.binomial(1024, p1) / 1024
+        x2 = rng.binomial(1024, p2) / 1024
+        res = run_scan("connection", x1, x2, (0.5, 1, 2, 4, 8), 0.01, n_shifts=99, seed=i)
+        ps.append(res["p_scan"])
+    rate = np.mean(np.array(ps) <= 0.05)
+    lo, hi = sps.binom.ppf([0.0005, 0.9995], sims, 0.05) / sims
+    assert lo <= rate <= hi, rate

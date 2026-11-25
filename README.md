@@ -164,7 +164,7 @@ Every session that starts is recorded, including sessions that were stopped earl
 
 `exploratory.json` and the lower panel of `session.png` show a multi-scale scan. Its statistic is the largest standardized windowed sum of the session's measure over all window lengths (5–160 s) and all positions, using full windows only. Its null distribution comes from circular time shifts:
 
-- **Connection:** generator 2 is shifted against generator 1.
+- **Connection:** generator 2 is shifted against generator 1. Before scanning, z1·z2 is centered on its session mean, in the data and in every shifted copy. This matters because this device has a small steady coupling between its generators (see "Hardware"). A coupling that lasts all session isn't a local event, and without centering, the shifts would remove it from the null while it stayed in the data. Ordinary sessions would then look unusual: in a test with a steady coupling, the uncentered scan flagged 20% of null sessions instead of 5%.
 - **Intention:** the aim sequence is shifted against the data.
 
 This keeps each stream's own bias, drift and autocorrelation and breaks only their alignment. `p_scan` answers: "is there a stretch somewhere in this session that is more unusual than chance would give, at any time scale?" Use it to generate hypotheses for future pre-specified tests, not as evidence.
@@ -208,11 +208,18 @@ The recorder is a separate process. It reads the device continuously, with no sl
 1. **MODE_UNWHITENED (57600) is not documented.** It appears only in the vendor's example scripts, as "Unwhitened RNG1-RNG2 (TrueRNGproV2 Only)". That doesn't say whether the stream interleaves the two generators or carries their difference, nor whether it is ASCII or binary. The earlier code parsed it as ASCII and split it by alternating values, but that behaviour couldn't be verified. **Decision:** use the documented MODE_RAW_BIN instead.
 2. **The command bytes 0xB0 (reset), 0xC4 and 0xC5 (select generator 1 or 2)** that the earlier code sent are not in any vendor document I found. The vendor page says modes are selected by baud rate precisely so the device does not have to listen for commands. **Decision:** don't send them.
 3. **Simultaneity.** The RAW_BIN documentation shows one sample from each generator per packet, but it does not state that the two samples are taken at the same instant. Within a packet they are at least adjacent, far closer than the old sequential reads 0.2 s or more apart.
-4. **LSB bias.** Vendor staff say the ADC LSB carries manufacturing-dependent bias. This fits the p(1) ≈ 0.4992 seen in every session. **Decision:** keep the LSB, for continuity with the existing data, and handle the bias through the protocol: lean estimated from REST blocks, statistics that cancel it, and permutation p-values. If you prefer, the full 10-bit samples are available in the parser for a different bit choice later.
+4. **LSB bias.** Vendor staff say the ADC LSB carries manufacturing-dependent bias. This fits the leans seen in practice: p(1) ≈ 0.4992 in the old data, and about 0.483 (generator 1) and 0.500–0.503 (generator 2) for the RAW_BIN LSBs on this unit (see below). **Decision:** keep the LSB, for continuity with the existing data, and handle the bias through the protocol: lean estimated from REST blocks, statistics that cancel it, and permutation p-values. If you prefer, the full 10-bit samples are available in the parser for a different bit choice later.
 5. **Read timestamps.** Each read is timestamped when its bytes arrive. USB and driver buffering mean the bits were generated slightly earlier, by an unknown but small amount when reading continuously. The 3 s gap before each block absorbs this.
 6. **RAW_ASC sample text and the TrueRNG V1/V2 differences** are inconsistent on the vendor pages. They aren't used here.
 
-**Please run `python app.py probe` once on the Pi.** It captures a sample in MODE_UNWHITENED and in MODE_RAW_BIN, saves the raw bytes under `probe/`, and prints what it finds. For MODE_UNWHITENED it reports whether the data is ASCII, any '-' signs, and the even/odd value statistics. For MODE_RAW_BIN it reports tag alignment, the packet rate, each generator's mean and SD (the vendor expects a mean of 400–600 and an SD of 30–100), the LSB bias, and the correlation between the generators. That settles the questions above for your unit.
+### What the probe found on this unit
+
+`python app.py probe` captures a sample in MODE_UNWHITENED and in MODE_RAW_BIN, saves the raw bytes under `probe/`, and prints what it finds. Run it again after changing hardware. On this TrueRNGproV2 (November 2026, 100,000 packets):
+
+- **MODE_RAW_BIN works exactly as documented.** There were 0 resyncs and 0 discarded bytes. It runs at about 117,000 samples per second per generator, which is about 114–118 paired reads per second at the default 1,024 bits per read. 10-bit means are 525 and 524, with SDs of 81 and 75, within the vendor's range.
+- **The LSB leans differ by generator.** Generator 1 sits at p(1) ≈ 0.483, about 10 standard errors from 0.5, and it was the same in a later session (0.484 from REST blocks). Generator 2 is close to 0.5 (0.503 in the probe, 0.500 in the session). The statistics handle this by design; see "LSB bias" above.
+- **The generators are slightly coupled.** The correlation between the two generators' LSBs is r ≈ −0.011, about 3.4 standard errors from zero. This is plausibly crosstalk, since the two samples are taken next to each other in each packet. A steady coupling cancels in the confirmatory connection statistic (it is present in both CONNECT and REST). The exploratory scan centers it out. Sham sessions will measure it more precisely over time.
+- **MODE_UNWHITENED** is ASCII, comma-separated, with values from 119 to 392 centered on 256 and no minus signs. Even and odd positions are statistically identical, so there's no evidence it alternates two generators, though identical generators would look the same. A centre of 256 with no negatives hints at a difference of the two generators shifted by 256, but the spread is too small for a plain difference of the RAW_BIN samples. Its format is still undetermined; it isn't used.
 
 ### Other judgment calls
 
@@ -230,7 +237,7 @@ The recorder is a separate process. It reads the device continuously, with no sl
 - **Null calibration:** 400 simulated sessions of each type give uniform p-values (KS test, and a rejection rate at 0.05 within binomial limits). This holds both with p(1) = 0.5 and with the hardware's lean (0.4992 / 0.4994). The NetVar secondary is checked too.
 - **Power:** with an injected intention effect of 2.5 standard errors (HIGH +δ, LOW −δ) and with an injected shared signal (correlation 0.06 in CONNECT blocks), the detection rate over 300 sessions matches the power expected for that effect size within ±0.09.
 - **Exact enumeration and Monte Carlo agree**, the ledger z round-trips to the session p, and stopped sessions use only completed blocks.
-- **The exploratory scan** is calibrated under the null (rejection rate within binomial limits) and locates an injected local burst.
+- **The exploratory scan** is calibrated under the null (rejection rate within binomial limits), stays calibrated when the generators have a steady coupling like this unit's, and locates an injected local burst.
 - **Acquisition:** RAW_BIN parsing, including chunking, garbage bytes and a dropped byte. Also the file format, including a truncated last record, and the recorder process.
 - **End to end:** a headless session; the real GUI loop driven by taps (the Stop button, and closing the window mid-session) produces a finalized session and a ledger row; a session killed with SIGKILL is recovered on the next start.
 
@@ -251,7 +258,7 @@ The earlier version had problems that the review of the code and the February 20
 
 Re-running those sessions through the new exploratory connection scan (`python app.py scan --legacy data`, saved in `reports/legacy_exploratory_scan.txt`):
 
-- **None of the 17 sessions has p_scan < 0.05.** The smallest is 0.061, and about 0.9 would be expected below 0.05 by chance.
+- **None of the 17 sessions has p_scan < 0.05.** The smallest is 0.075, and about 0.9 would be expected below 0.05 by chance.
 - Generator leans are 0.4990–0.4995 in every session.
 - The correlation between z1 and z2 per read ranges from −0.058 to +0.065.
 - The no-stall fraction of wall time is about 40%.
