@@ -93,3 +93,18 @@ def test_recorder_process_with_sim_source(tmp_path):
     assert np.all(np.diff(paired["seq"]) == 1)          # no gaps
     assert np.all(np.diff(paired["t_start"]) > 0)
     assert os.path.exists(tmp_path / "acq_log.csv")
+
+
+def test_probe_descriptions_on_synthetic_captures():
+    from dualrng.probe import describe_raw_bin, describe_unwhitened
+
+    rng = np.random.default_rng(2)
+    s1 = rng.normal(490, 50, 3000).clip(0, 1023).astype(int)
+    s2 = rng.normal(530, 40, 3000).clip(0, 1023).astype(int)
+    text = "\n".join(describe_raw_bin(encode_packets(s1, s2), 0.5))
+    assert "packets: 3000" in text and "resyncs: 0" in text
+    # An ASCII stream alternating two generators with different means
+    vals = np.ravel(np.column_stack([s1, s2]))
+    ascii_stream = (",".join(str(v) for v in vals) + ",").encode()
+    text = "\n".join(describe_unwhitened(ascii_stream))
+    assert "even-position mean" in text and "contains '-' signs: False" in text

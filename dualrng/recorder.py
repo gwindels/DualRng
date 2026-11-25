@@ -27,7 +27,7 @@ def _log(path: str, event: str, detail: str = "") -> None:
 
 
 def recorder_main(session_dir: str, source_spec: dict, bits_per_read: int,
-                  stop_event, ready_event, error_event) -> None:
+                  stop_event, ready_event, error_event, parent_pid: int | None = None) -> None:
     from .sources import build_source
 
     log_path = os.path.join(session_dir, "acq_log.csv")
@@ -40,11 +40,20 @@ def recorder_main(session_dir: str, source_spec: dict, bits_per_read: int,
         _log(log_path, "start", repr(source.describe()))
         ready_event.set()
         seq = 0
-        last_stats = time.monotonic()
+        last_stats = last_parent_check = time.monotonic()
         while not stop_event.is_set():
             t_start, t_end, b1, b2 = source.read_pair()
             writer.write_pair(seq, t_start, t_end, b1, b2)
             seq += 1
+            now = time.monotonic()
+            if parent_pid and now - last_parent_check > 1.0:
+                last_parent_check = now
+                if os.getppid() != parent_pid:
+                    # The program that started this session died without stopping us.
+                    # Release the device; the data so far is on disk and will be
+                    # finalized the next time the app starts.
+                    _log(log_path, "parent_gone", f"reads={seq}")
+                    break
             if time.monotonic() - last_stats > 10:
                 st = source.stats()
                 if st:
@@ -77,7 +86,7 @@ class Recorder:
         self.process = ctx.Process(
             target=recorder_main,
             args=(session_dir, source_spec, bits_per_read,
-                  self.stop_event, self.ready_event, self.error_event),
+                  self.stop_event, self.ready_event, self.error_event, os.getpid()),
             name="dualrng-recorder",
             daemon=False,
         )
