@@ -247,13 +247,13 @@ The earlier version had problems that the review of the code and the February 20
 - The two generators were read one after the other, not as pairs.
 - Its multi-scale analysis tested half-full windows as if full, and its 8-second scale correlated only 2–4 points.
 - Its Global Z treated overlapping windows as independent.
-- Its event CSVs were re-written on every refresh. The 10 sessions' `multiscale_events_*.csv` files hold 8,567 rows, but only 246 unique (time, scale) events. 146 of those are at the 5-minute scale, mostly from half-full windows early in a session.
+- Its event CSVs were re-written on every refresh. The 13 `multiscale_events_*.csv` files hold 13,593 rows, but only 353 unique (time, scale) events. 176 of those are at the 5-minute scale, mostly from half-full windows early in a session.
 
 Re-running those sessions through the new exploratory connection scan (`python app.py scan --legacy data`, saved in `reports/legacy_exploratory_scan.txt`):
 
-- **None of the 10 sessions has p_scan < 0.05.** The smallest is 0.061, and about 0.5 would be expected below 0.05 by chance.
+- **None of the 17 sessions has p_scan < 0.05.** The smallest is 0.061, and about 0.9 would be expected below 0.05 by chance.
 - Generator leans are 0.4990–0.4995 in every session.
-- The correlation between z1 and z2 per read ranges from −0.058 to +0.027.
+- The correlation between z1 and z2 per read ranges from −0.058 to +0.065.
 - The no-stall fraction of wall time is about 40%.
 
 This is exploratory. The legacy sessions had no randomized protocol, so they can't be analyzed with the confirmatory statistics.
