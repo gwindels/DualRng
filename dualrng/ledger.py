@@ -17,7 +17,7 @@ from .protocol import DEFAULT_TAIL
 from .stats import stouffer
 
 FIELDS = [
-    "session_id", "date", "session_type", "condition", "status",
+    "session_id", "date", "session_type", "condition", "status", "feedback",
     "statistic_name", "statistic", "z", "p", "tail", "z_parametric",
     "secondary_name", "secondary_statistic", "secondary_z", "secondary_p",
     "lean_p1", "lean_p2", "blocks_used", "bits_collected", "bits_analyzed",
@@ -50,6 +50,16 @@ def append_row(path: str, row: dict) -> bool:
         existing = list(csv.DictReader(io.StringIO(content))) if content else []
         if any(r.get("session_id") == row["session_id"] for r in existing):
             return False
+        header = next(csv.reader(io.StringIO(content)), None) if content else None
+        if header is not None and header != FIELDS:
+            # Ledger written by an older version: rewrite it with the current
+            # columns, keeping every existing value (new columns left blank).
+            f.seek(0)
+            f.truncate()
+            w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+            w.writeheader()
+            for r in existing:
+                w.writerow({k: r.get(k, "") or "" for k in FIELDS})
         f.seek(0, os.SEEK_END)
         w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         if f.tell() == 0:
@@ -119,6 +129,24 @@ def real_vs_sham(groups: list) -> list:
     return res
 
 
+def by_feedback(rows: list, complete_only: bool = False) -> list:
+    """Stouffer Z per (type, condition, display), for groups that used more than one display."""
+    out = []
+    for stype in ("intention", "connection"):
+        for cond in ("real", "sham"):
+            grp = [r for r in rows if r["session_type"] == stype and r["condition"] == cond
+                   and (not complete_only or r["status"] == "complete")]
+            displays = sorted({r.get("feedback") or "unrecorded" for r in grp})
+            if len(displays) < 2:
+                continue
+            for fb in displays:
+                sub = [r for r in grp if (r.get("feedback") or "unrecorded") == fb]
+                Z, k = stouffer([_float(r["z"]) for r in sub])
+                out.append({"session_type": stype, "condition": cond, "feedback": fb, "k": k,
+                            "stouffer_z": Z, "p": _p_for(Z, DEFAULT_TAIL[stype]) if k else float("nan")})
+    return out
+
+
 def format_report(path: str, complete_only: bool = False) -> str:
     rows = read_ledger(path)
     if not rows:
@@ -138,6 +166,13 @@ def format_report(path: str, complete_only: bool = False) -> str:
         p = "" if not g["with_result"] else f"{g['p']:9.4f}"
         lines.append(f"{g['session_type']:<11} {g['condition']:<5} {g['with_result']:>4} "
                      f"{g['incomplete']:>7} {z:>11} {p:>9} {g['tail']:<10} {nv:>9} {g['bits']:>12.3g}")
+    fb = by_feedback(rows, complete_only)
+    if fb:
+        lines += ["", "By display (only where more than one display was used):"]
+        for g in fb:
+            z = f"{g['stouffer_z']:+.3f}" if g["k"] else "   n/a"
+            p = f"{g['p']:.4f}" if g["k"] else "n/a"
+            lines.append(f"  {g['session_type']:<11} {g['condition']:<5} {g['feedback']:<10} k {g['k']:>3}  Z {z}  p {p}")
     diffs = real_vs_sham(groups)
     if diffs:
         lines += ["", "Real vs sham (difference in mean session z):"]

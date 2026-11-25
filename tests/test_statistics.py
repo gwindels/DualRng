@@ -148,3 +148,13 @@ def test_ledger_z_converts_back_to_session_p(kind):
         p = analyze_arrays(cfg, reads, plan, seed=1)["primary"]
         if p["p"] < 1 - 1e-9:
             assert _p_for(p["z"], p["tail"]) == pytest.approx(p["p"], rel=1e-9)
+
+
+def test_display_is_part_of_the_protocol_hash():
+    a = ProtocolConfig(session_type="intention", feedback="trace")
+    b = ProtocolConfig(session_type="intention", feedback="wave")
+    assert a.config_hash() != b.config_hash()
+    assert ProtocolConfig(session_type="intention").feedback == "trace"
+    assert ProtocolConfig(session_type="connection").feedback == "wave"
+    with pytest.raises(ValueError):
+        ProtocolConfig(session_type="connection", feedback="trace")

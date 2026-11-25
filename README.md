@@ -28,7 +28,7 @@ python app.py --gui --block-seconds 20 --blocks-per-label 10
 python app.py --gui --source sim            # no hardware needed
 ```
 
-On the idle screen, choose **Intention** or **Connection** and turn **Sham** on or off, then tap **Start Session**. The line under the buttons shows the block plan and the total duration. The summary at the top shows the result of the last session.
+On the idle screen, choose **Intention** or **Connection** and turn **Sham** on or off. For intention, also pick the **Display**: `trace` (the default) or `wave`. Then tap **Start Session**. The line under the buttons shows the block plan and the total duration. The summary at the top shows the result of the last session.
 
 During a session:
 
@@ -36,12 +36,28 @@ During a session:
 |---|---|
 | Top left | The cue for the current block: **AIM HIGH**, **AIM LOW**, **CONNECT** or **REST**. Between blocks it shows the next cue, dimmed. |
 | Top right | Block progress (`Block 5/24`) |
-| Wave | Live feedback. It grows calmer and brighter as the current block's measure moves the intended way (see "Live feedback"). |
+| Middle | Live feedback: the **trace** or the **wave** (see "Displays" below) |
 | Bottom right | The current block's z (see "Live feedback") |
 | Bottom center | Circles for completed blocks that went the intended way (z > 1). The colour shows how strongly: purple > 1, orange > 1.645, yellow > 2.33, pink > 3.09. |
 | Bottom left | **Stop**. Tap it twice within 3 seconds to end the session early. |
 
 A sham session shows **CONTROL**, the block progress, and a dimmed wave that does not respond. It shows no cues and no feedback.
+
+#### Displays
+
+**Trace (intention, default).** During each AIM HIGH or AIM LOW block, a line starts at the left edge as the block begins and reaches the right edge as it ends.
+
+- **What the line shows:** it is the block's *cumulative deviation*. Each read moves it up if that read had more 1s than the generators' usual lean (estimated from REST blocks), and down if fewer. Up always means more 1s.
+- **The arrow** on the right shows the aim: up for AIM HIGH, down for AIM LOW.
+- **The gray curves** show where chance alone keeps the line 95% of the time (±1.96 √reads). A line that runs outside them in the aimed direction is doing something chance rarely does.
+- **Colours** follow the same palette as the wave. The line goes from amber through yellow and green to pale gold as the block moves further the aimed way.
+- **Between blocks and in REST blocks,** only the centre line shows.
+
+This is the classic display for RNG intention work, the same idea as the Global Consciousness Project's cumulative deviation graphs.
+
+**Wave (connection, and optional for intention).** This is the original sine-wave visual. It grows calmer and brighter as the current block's measure moves the intended way. It suits group and connection sessions, where the goal is coherence rather than a direction.
+
+The display is part of the protocol. It is saved in `meta.json` and the ledger (`feedback` column: `trace`, `wave`, `text` for headless runs, `none` for sham), and it changes the config hash. The report shows results by display whenever more than one display has been used, so sessions run differently are never pooled unknowingly.
 
 Double-tap the screen to leave fullscreen, and press Escape to quit. **However the session ends** (it finishes, you tap Stop, you quit, the window closes, or the app gets Ctrl-C or SIGTERM), the session is stopped, analyzed and added to the ledger. If the program is killed or the Pi loses power, the data recorded up to that point is already on disk. That session is analyzed the next time the app starts.
 
@@ -137,13 +153,14 @@ Because the labels were assigned to blocks at random, the null hypothesis ("labe
 | `blocks_used` | Blocks that completed and contained data |
 | `bits_collected` / `bits_analyzed` | All bits recorded, and the bits inside analyzed blocks |
 | `status` | `complete`, `stopped` (ended early), `interrupted` (the program died), `recorder_failed`; suffixed `-no-result` if too few blocks completed for a test |
+| `feedback` | What the participant saw: `trace`, `wave`, `text` (headless) or `none` (sham) |
 | `config_hash` | Identifies the exact protocol and analysis version |
 
 ### Live feedback (display only)
 
 The GUI shows the session's own measure on the current block:
 
-- **Intention:** the z of the block's proportion of 1s, compared with the lean estimated from REST blocks so far. It is signed by the aim, so positive always means "the way you are aiming".
+- **Intention:** the z of the block's proportion of 1s, compared with the lean estimated from REST blocks so far (before the first REST block: all other data so far, never the block being shown). The number at bottom right is the trace's current height divided by √reads, so up is positive. The tally circles and colours are signed by the aim, so they always mean "the way you are aiming".
 - **Connection:** the sum of `z1*z2` over the block divided by √(reads in the block).
 
 Live feedback is not the result. The confirmatory p comes from the permutation test after the session.
@@ -164,7 +181,7 @@ Every session that starts is recorded, including sessions that were stopped earl
 
 `exploratory.json` and the lower panel of `session.png` show a multi-scale scan. Its statistic is the largest standardized windowed sum of the session's measure over all window lengths (5–160 s) and all positions, using full windows only. Its null distribution comes from circular time shifts:
 
-- **Connection:** generator 2 is shifted against generator 1.
+- **Connection:** generator 2 is shifted against generator 1. Before scanning, z1·z2 is centered on its session mean, in the data and in every shifted copy. This matters because this device has a small steady coupling between its generators (see "Hardware"). A coupling that lasts all session isn't a local event, and without centering, the shifts would remove it from the null while it stayed in the data. Ordinary sessions would then look unusual: in a test with a steady coupling, the uncentered scan flagged 20% of null sessions instead of 5%.
 - **Intention:** the aim sequence is shifted against the data.
 
 This keeps each stream's own bias, drift and autocorrelation and breaks only their alignment. `p_scan` answers: "is there a stretch somewhere in this session that is more unusual than chance would give, at any time scale?" Use it to generate hypotheses for future pre-specified tests, not as evidence.
@@ -194,6 +211,8 @@ Code layout: `dualrng/recorder.py` (acquisition), `sources.py` (hardware and sim
 
 The recorder is a separate process. It reads the device continuously, with no sleeps and no mode switching, and appends every read to `reads.bin`. Each write is flushed immediately and fsynced every second. The GUI, live feedback and analysis only read that file, so none of them can stall acquisition. If the main program dies, the recorder notices within a second, releases the serial port and exits.
 
+**One clock for both processes.** Block times are written by the main program, and read timestamps by the recorder, so the two must read the same clock. Both use `dualrng/clock.py`, the system-wide monotonic clock (`clock_gettime(CLOCK_MONOTONIC)`). Python's `time.monotonic()` is not safe here: on at least one macOS Python build, a spawned process's `time.monotonic()` disagreed with its parent's by seconds, which put reads in the wrong blocks. At every session start, the recorder reports its clock reading and the session refuses to start if the two processes disagree by more than half a second. The measured offset is saved in `meta.json` (`recorder_clock_offset_s`).
+
 ---
 
 ## Hardware
@@ -208,11 +227,18 @@ The recorder is a separate process. It reads the device continuously, with no sl
 1. **MODE_UNWHITENED (57600) is not documented.** It appears only in the vendor's example scripts, as "Unwhitened RNG1-RNG2 (TrueRNGproV2 Only)". That doesn't say whether the stream interleaves the two generators or carries their difference, nor whether it is ASCII or binary. The earlier code parsed it as ASCII and split it by alternating values, but that behaviour couldn't be verified. **Decision:** use the documented MODE_RAW_BIN instead.
 2. **The command bytes 0xB0 (reset), 0xC4 and 0xC5 (select generator 1 or 2)** that the earlier code sent are not in any vendor document I found. The vendor page says modes are selected by baud rate precisely so the device does not have to listen for commands. **Decision:** don't send them.
 3. **Simultaneity.** The RAW_BIN documentation shows one sample from each generator per packet, but it does not state that the two samples are taken at the same instant. Within a packet they are at least adjacent, far closer than the old sequential reads 0.2 s or more apart.
-4. **LSB bias.** Vendor staff say the ADC LSB carries manufacturing-dependent bias. This fits the p(1) ≈ 0.4992 seen in every session. **Decision:** keep the LSB, for continuity with the existing data, and handle the bias through the protocol: lean estimated from REST blocks, statistics that cancel it, and permutation p-values. If you prefer, the full 10-bit samples are available in the parser for a different bit choice later.
+4. **LSB bias.** Vendor staff say the ADC LSB carries manufacturing-dependent bias. This fits the leans seen in practice: p(1) ≈ 0.4992 in the old data, and about 0.483 (generator 1) and 0.500–0.503 (generator 2) for the RAW_BIN LSBs on this unit (see below). **Decision:** keep the LSB, for continuity with the existing data, and handle the bias through the protocol: lean estimated from REST blocks, statistics that cancel it, and permutation p-values. If you prefer, the full 10-bit samples are available in the parser for a different bit choice later.
 5. **Read timestamps.** Each read is timestamped when its bytes arrive. USB and driver buffering mean the bits were generated slightly earlier, by an unknown but small amount when reading continuously. The 3 s gap before each block absorbs this.
 6. **RAW_ASC sample text and the TrueRNG V1/V2 differences** are inconsistent on the vendor pages. They aren't used here.
 
-**Please run `python app.py probe` once on the Pi.** It captures a sample in MODE_UNWHITENED and in MODE_RAW_BIN, saves the raw bytes under `probe/`, and prints what it finds. For MODE_UNWHITENED it reports whether the data is ASCII, any '-' signs, and the even/odd value statistics. For MODE_RAW_BIN it reports tag alignment, the packet rate, each generator's mean and SD (the vendor expects a mean of 400–600 and an SD of 30–100), the LSB bias, and the correlation between the generators. That settles the questions above for your unit.
+### What the probe found on this unit
+
+`python app.py probe` captures a sample in MODE_UNWHITENED and in MODE_RAW_BIN, saves the raw bytes under `probe/`, and prints what it finds. Run it again after changing hardware. On this TrueRNGproV2 (November 2026, 100,000 packets):
+
+- **MODE_RAW_BIN works exactly as documented.** There were 0 resyncs and 0 discarded bytes. It runs at about 117,000 samples per second per generator, which is about 114–118 paired reads per second at the default 1,024 bits per read. 10-bit means are 525 and 524, with SDs of 81 and 75, within the vendor's range.
+- **The LSB leans differ by generator.** Generator 1 sits at p(1) ≈ 0.483, about 10 standard errors from 0.5, and it was the same in a later session (0.484 from REST blocks). Generator 2 is close to 0.5 (0.503 in the probe, 0.500 in the session). The statistics handle this by design; see "LSB bias" above.
+- **The generators are slightly coupled.** The correlation between the two generators' LSBs is r ≈ −0.011, about 3.4 standard errors from zero. This is plausibly crosstalk, since the two samples are taken next to each other in each packet. A steady coupling cancels in the confirmatory connection statistic (it is present in both CONNECT and REST). The exploratory scan centers it out. Sham sessions will measure it more precisely over time.
+- **MODE_UNWHITENED** is ASCII, comma-separated, with values from 119 to 392 centered on 256 and no minus signs. Even and odd positions are statistically identical, so there's no evidence it alternates two generators, though identical generators would look the same. A centre of 256 with no negatives hints at a difference of the two generators shifted by 256, but the spread is too small for a plain difference of the RAW_BIN samples. Its format is still undetermined; it isn't used.
 
 ### Other judgment calls
 
@@ -230,9 +256,15 @@ The recorder is a separate process. It reads the device continuously, with no sl
 - **Null calibration:** 400 simulated sessions of each type give uniform p-values (KS test, and a rejection rate at 0.05 within binomial limits). This holds both with p(1) = 0.5 and with the hardware's lean (0.4992 / 0.4994). The NetVar secondary is checked too.
 - **Power:** with an injected intention effect of 2.5 standard errors (HIGH +δ, LOW −δ) and with an injected shared signal (correlation 0.06 in CONNECT blocks), the detection rate over 300 sessions matches the power expected for that effect size within ±0.09.
 - **Exact enumeration and Monte Carlo agree**, the ledger z round-trips to the session p, and stopped sessions use only completed blocks.
-- **The exploratory scan** is calibrated under the null (rejection rate within binomial limits) and locates an injected local burst.
+- **The exploratory scan** is calibrated under the null (rejection rate within binomial limits), stays calibrated when the generators have a steady coupling like this unit's, and locates an injected local burst.
 - **Acquisition:** RAW_BIN parsing, including chunking, garbage bytes and a dropped byte. Also the file format, including a truncated last record, and the recorder process.
-- **End to end:** a headless session; the real GUI loop driven by taps (the Stop button, and closing the window mid-session) produces a finalized session and a ledger row; a session killed with SIGKILL is recovered on the next start.
+- **End to end:**
+  - A headless session completes and is saved.
+  - A strong injected HIGH/LOW effect, run through the real recorder process, shows up in the right blocks with the right sign.
+  - The recorder's timestamps match the main program's clock, including for a recorder started after an earlier one.
+  - The real GUI loop, driven by taps, produces a finalized session and a ledger row when you tap Stop and when you close the window mid-session.
+  - An intention session with the trace display draws the trace during aimed blocks and records `feedback: trace`.
+  - A session killed with SIGKILL is recovered on the next start.
 
 The simulator draws bits with `p(1) = lean ± δ` for intention effects. It adds a shared random shift to both generators' p(1) to give a stated correlation `rho` between their per-read z scores. Use `--sim-delta` and `--sim-rho` to see what an effect of a given size looks like in the GUI and report.
 
@@ -251,7 +283,7 @@ The earlier version had problems that the review of the code and the February 20
 
 Re-running those sessions through the new exploratory connection scan (`python app.py scan --legacy data`, saved in `reports/legacy_exploratory_scan.txt`):
 
-- **None of the 17 sessions has p_scan < 0.05.** The smallest is 0.061, and about 0.9 would be expected below 0.05 by chance.
+- **None of the 17 sessions has p_scan < 0.05.** The smallest is 0.075, and about 0.9 would be expected below 0.05 by chance.
 - Generator leans are 0.4990–0.4995 in every session.
 - The correlation between z1 and z2 per read ranges from −0.058 to +0.065.
 - The no-stall fraction of wall time is about 40%.

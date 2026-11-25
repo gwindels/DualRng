@@ -2,6 +2,7 @@ import math
 import os
 import time
 
+import numpy as np
 import pygame
 
 from color_theme import ColorTheme
@@ -23,9 +24,13 @@ class SineGUI:
 
         mode         "idle" | "starting" | "session" | "finishing"
         cue          large text top-left (e.g. "AIM HIGH"), "" for none
+        display      "wave" or "trace"
+        trace        cumulative deviation of the current block (trace display), or None
+        aim          +1 (AIM HIGH), -1 (AIM LOW), 0 (no target)
+        block_frac   how far through the current block we are, 0..1
         cue_dim      draw the cue in gray (between blocks / sham)
         progress     text top-right (e.g. "Block 3/24")
-        feedback     text bottom-right (e.g. "z +1.20")
+        feedback_text  text bottom-right (e.g. "z +1.20")
         coherence    0..1, drives the wave
         summary      text on the idle screen
     """
@@ -52,6 +57,8 @@ class SineGUI:
         # Idle-screen selections
         self.session_type = "intention"
         self.sham = False
+        self.feedback = "trace"       # display chosen for intention sessions
+        self.buttons = {}
         self.plan_text = ""
         self.summary = ""
 
@@ -60,10 +67,14 @@ class SineGUI:
         self.cue = ""
         self.cue_dim = False
         self.progress = ""
-        self.feedback = ""
+        self.feedback_text = ""
         self.status = ""
         self.coherence = 0.0
         self.smoothed_coherence = 0.0
+        self.display = "wave"
+        self.trace = None
+        self.aim = 0
+        self.block_frac = 0.0
         self.tally = []
         self._stop_armed_until = 0.0
 
@@ -124,8 +135,11 @@ class SineGUI:
         self.smoothed_coherence = 0.0
         self.cue = ""
         self.progress = ""
-        self.feedback = ""
+        self.feedback_text = ""
         self.status = ""
+        self.trace = None
+        self.aim = 0
+        self.block_frac = 0.0
         self.tally = []
         self.flash_active = False
 
@@ -144,7 +158,7 @@ class SineGUI:
         y /= (1 + count)
         return int(self.height / 2 - y * base_amp)
 
-    def draw_wave(self, t, coherence):
+    def coherence_color(self, coherence):
         col = self.theme.color("highlight")
         if coherence > 0.5:
             col = self.theme.color("heaven")
@@ -154,8 +168,10 @@ class SineGUI:
             col = self.theme.color("yellow")
         elif coherence > 0.2:
             col = self.theme.color("lightamber")
-        if self.cue_dim:
-            col = self.theme.color("darkgray")
+        return col
+
+    def frame_colors(self, col):
+        """Background and foreground for this frame, including the tally flash."""
         bg = self.theme.color("background")
         if self.flash_active:
             elapsed = time.time() - self.flash_start_time
@@ -167,7 +183,13 @@ class SineGUI:
                     bg = self.theme.color("white")
             else:
                 self.flash_active = False
+        return bg, col
 
+    def draw_wave(self, t, coherence):
+        col = self.coherence_color(coherence)
+        if self.cue_dim:
+            col = self.theme.color("darkgray")
+        bg, col = self.frame_colors(col)
         self.screen.fill(bg)
         step = 4
         prev_x = 0
@@ -176,6 +198,52 @@ class SineGUI:
             y = self.calculate_y(x, t, coherence)
             pygame.draw.line(self.screen, col, (prev_x, prev_y), (x, y), 4)
             prev_x, prev_y = x, y
+
+    def draw_trace(self):
+        """Cumulative deviation of the current block.
+
+        The line starts at the left edge when the block starts and reaches the
+        right edge when it ends. Up means more 1s than the generators' usual
+        lean (estimated from REST blocks). The gray curves are the range chance
+        alone keeps the line inside 95% of the time (+/-1.96 sqrt(reads)).
+        """
+        left, right = 50, self.width - 70
+        mid = self.height // 2
+        half = self.height // 2 - 80
+        trace = self.trace
+        aim_z = 0.0
+        if trace is not None and len(trace) > 1:
+            aim_z = self.aim * trace[-1] / math.sqrt(len(trace))
+        col = self.coherence_color(max(0.0, min(1.0, aim_z / 2.5)))
+        bg, col = self.frame_colors(col)
+        self.screen.fill(bg)
+        dim = self.theme.color("darkgray")
+        pygame.draw.line(self.screen, dim, (left, mid), (right, mid), 2)
+        if trace is None or len(trace) < 2:
+            return
+        frac = min(max(self.block_frac, 1e-3), 1.0)
+        K = max(len(trace) / frac, len(trace))   # reads expected in the whole block
+        scale = half / (2.6 * math.sqrt(K))     # the envelope ends at ~75% of the height
+        t = np.linspace(0.0, 1.0, 120)[1:]
+        xs = left + t * (right - left)
+        env = 1.96 * np.sqrt(t * K) * scale
+        for sign in (1, -1):
+            pts = list(zip(xs.astype(int), (mid - sign * env).astype(int)))
+            pygame.draw.lines(self.screen, dim, False, [(left, mid)] + pts, 2)
+        n = len(trace)
+        idx = np.unique(np.linspace(0, n - 1, min(n, right - left)).astype(int))
+        px = left + (idx + 1) / K * (right - left)
+        py = np.clip(mid - trace[idx] * scale, 40, self.height - 40)
+        pts = [(left, mid)] + list(zip(px.astype(int), py.astype(int)))
+        pygame.draw.lines(self.screen, col, False, pts, 4)
+        pygame.draw.circle(self.screen, col, pts[-1], 7)
+        if self.aim:
+            ax = right + 40
+            tip = mid - self.aim * (half - 10)
+            base = mid - self.aim * (half - 50)
+            acol = self.theme.color("gray")
+            pygame.draw.line(self.screen, acol, (ax, mid - self.aim * 20), (ax, base), 4)
+            pygame.draw.polygon(self.screen, acol, [(ax, tip), (ax - 14, base), (ax + 14, base)])
 
     def draw_text(self, text, text_color=(255, 255, 255), x=0, y=0, align="topleft", font=None):
         surface = (font or self.font).render(str(text), True, text_color)
@@ -220,15 +288,19 @@ class SineGUI:
         gray = self.theme.color("gray")
         if self.summary:
             for i, line in enumerate(self.summary.split("\n")[:2]):
-                self.draw_text(line, gray, cx, cy - 190 + 28 * i, align="center")
+                self.draw_text(line, gray, cx, cy - 195 + 28 * i, align="center")
         buttons = {
-            "intention": self.draw_button("Intention", (cx - 230, cy - 100), self.session_type == "intention"),
-            "connection": self.draw_button("Connection", (cx, cy - 100), self.session_type == "connection"),
-            "sham": self.draw_button("Sham: on" if self.sham else "Sham: off", (cx + 230, cy - 100), self.sham),
+            "intention": self.draw_button("Intention", (cx - 140, cy - 115), self.session_type == "intention"),
+            "connection": self.draw_button("Connection", (cx + 140, cy - 115), self.session_type == "connection"),
+            "sham": self.draw_button("Sham: on" if self.sham else "Sham: off",
+                                     (cx - 140 if self.session_type == "intention" else cx, cy - 45), self.sham),
         }
-        self.draw_text(self.plan_text, gray, cx, cy - 45, align="center")
-        buttons["start"] = self.draw_button("Start Session", (cx, cy + 20))
-        buttons["quit"] = self.draw_button("Quit", (cx, cy + 120))
+        if self.session_type == "intention":
+            buttons["display"] = self.draw_button(f"Display: {self.feedback}", (cx + 140, cy - 45))
+        self.draw_text(self.plan_text, gray, cx, cy + 10, align="center")
+        buttons["start"] = self.draw_button("Start Session", (cx, cy + 70))
+        buttons["quit"] = self.draw_button("Quit", (cx, cy + 160))
+        self.buttons = buttons
         return buttons
 
     def draw_message(self, text):
@@ -239,13 +311,17 @@ class SineGUI:
         t = time.time() - self.start_time
         alpha = 0.05
         self.smoothed_coherence = (1 - alpha) * self.smoothed_coherence + alpha * self.coherence
-        self.draw_wave(t * 2 * math.pi, self.smoothed_coherence)
+        if self.display == "trace":
+            self.draw_trace()
+        else:
+            self.draw_wave(t * 2 * math.pi, self.smoothed_coherence)
         cue_color = self.theme.color("gray") if self.cue_dim else self.theme.color("highlight")
         if self.cue:
             self.draw_text(self.cue, cue_color, 14, 10, "topleft", font=self.big_font)
         self.draw_text(self.progress, self.theme.color("gray"), self.width - 10, 10, "topright")
-        if self.feedback:
-            self.draw_text(self.feedback, self.theme.color("gray"), self.width - 10, self.height - 10, "bottomright")
+        if self.feedback_text:
+            self.draw_text(self.feedback_text, self.theme.color("gray"), self.width - 10, self.height - 10,
+                           "bottomright")
         if self.status:
             self.draw_text(self.status, self.theme.color("lightamber"), self.width // 2, self.height - 10,
                            "center")
@@ -254,7 +330,8 @@ class SineGUI:
         stop_rect = self.draw_text(stop_label, self.theme.color("lightamber" if armed else "gray"),
                                    10, self.height - 10, "bottomleft")
         self.draw_tally_circles(self.tally, y=self.height - 30)
-        return stop_rect.inflate(30, 30)
+        self.buttons = {"stop": stop_rect.inflate(30, 30)}
+        return self.buttons["stop"]
 
     # ------------------------------------------------------------------
     def _handle_common(self, event):
@@ -301,13 +378,16 @@ class SineGUI:
                                 self.session_type = "connection"
                             elif buttons["sham"].collidepoint(event.pos):
                                 self.sham = not self.sham
+                            elif "display" in buttons and buttons["display"].collidepoint(event.pos):
+                                self.feedback = "wave" if self.feedback == "trace" else "trace"
                             elif buttons["start"].collidepoint(event.pos) and self.controller:
                                 self.reset()
-                                self.controller.start(self.session_type, self.sham)
+                                self.controller.start(self.session_type, self.sham, self.chosen_feedback())
                             elif buttons["quit"].collidepoint(event.pos):
                                 self.running = False
                             if self.controller:
-                                self.controller.selection_changed(self.session_type, self.sham)
+                                self.controller.selection_changed(self.session_type, self.sham,
+                                                                  self.chosen_feedback())
                 elif self.mode == "session":
                     stop_rect = self.draw_session()
                     for event in pygame.event.get():
@@ -333,6 +413,9 @@ class SineGUI:
             if self.controller is not None:
                 self.controller.shutdown()
             self._close_display()
+
+    def chosen_feedback(self):
+        return self.feedback if self.session_type == "intention" else "wave"
 
     def stop(self):
         self.running = False

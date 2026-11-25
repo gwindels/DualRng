@@ -1,8 +1,9 @@
 """Running one session: freeze the config, start the recorder, write the
 schedule, follow the clock, stop, and finalize.
 
-All timing uses time.monotonic(), which is shared by the recorder process, so
-block boundaries and read timestamps are on the same clock.
+All timing uses dualrng.clock.now() (the system-wide monotonic clock), which
+the recorder process also uses, so block boundaries and read timestamps are on
+the same clock. Recorder start-up verifies this.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import time
 from datetime import datetime
 
 from .analysis import finalize_session, write_json
+from . import clock
 from .protocol import CUES, ProtocolConfig, make_schedule, plan_blocks, write_schedule
 from .recorder import Recorder
 
@@ -56,10 +58,11 @@ class SessionRunner:
         self.recorder = Recorder(self.dir, self.source_spec, self.config.bits_per_read)
         self.recorder.start()
         labels = make_schedule(self.config)
-        t0 = time.monotonic() + self.lead_seconds
+        t0 = clock.now() + self.lead_seconds
         self.plan = plan_blocks(labels, t0, self.config.block_seconds, self.config.gap_seconds)
         write_schedule(self.dir, self.plan, self.meta["started_wall"], t0)
-        self.meta.update({"t0_mono": t0, "wall_minus_mono": time.time() - time.monotonic(),
+        self.meta.update({"t0_mono": t0, "wall_minus_mono": time.time() - clock.now(),
+                          "recorder_clock_offset_s": self.recorder.clock_offset,
                           "planned_end_mono": self.plan[-1]["end"]})
         self._write_meta()
 
@@ -70,7 +73,7 @@ class SessionRunner:
         if self.stopped:
             return
         self.stopped = True
-        now = time.monotonic()
+        now = clock.now()
         failed = self.recorder is not None and self.recorder.failed
         if self.recorder is not None:
             self.recorder.stop()
@@ -89,12 +92,12 @@ class SessionRunner:
 
     # -- clock ---------------------------------------------------------
     def done(self, now: float | None = None) -> bool:
-        now = time.monotonic() if now is None else now
+        now = clock.now() if now is None else now
         return bool(self.plan) and now >= self.plan[-1]["end"]
 
     def state(self, now: float | None = None) -> dict:
         """Where the session is right now: lead-in, gap before a block, in a block, or done."""
-        now = time.monotonic() if now is None else now
+        now = clock.now() if now is None else now
         n = len(self.plan)
         if not n:
             return {"phase": "starting"}

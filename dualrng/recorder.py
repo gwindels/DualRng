@@ -13,6 +13,7 @@ import time
 import traceback
 
 from .records import ReadsWriter
+from . import clock
 
 
 def _log(path: str, event: str, detail: str = "") -> None:
@@ -21,13 +22,14 @@ def _log(path: str, event: str, detail: str = "") -> None:
         w = csv.writer(f)
         if new:
             w.writerow(["t_mono", "wall", "event", "detail"])
-        w.writerow([f"{time.monotonic():.6f}", time.strftime("%Y-%m-%d %H:%M:%S"), event, detail])
+        w.writerow([f"{clock.now():.6f}", time.strftime("%Y-%m-%d %H:%M:%S"), event, detail])
         f.flush()
         os.fsync(f.fileno())
 
 
 def recorder_main(session_dir: str, source_spec: dict, bits_per_read: int,
-                  stop_event, ready_event, error_event, parent_pid: int | None = None) -> None:
+                  stop_event, ready_event, error_event, parent_pid: int | None = None,
+                  ready_clock=None) -> None:
     from .sources import build_source
 
     log_path = os.path.join(session_dir, "acq_log.csv")
@@ -38,14 +40,16 @@ def recorder_main(session_dir: str, source_spec: dict, bits_per_read: int,
         source.open()
         writer = ReadsWriter(os.path.join(session_dir, "reads.bin"), bits_per_read)
         _log(log_path, "start", repr(source.describe()))
+        if ready_clock is not None:
+            ready_clock.value = clock.now()
         ready_event.set()
         seq = 0
-        last_stats = last_parent_check = time.monotonic()
+        last_stats = last_parent_check = clock.now()
         while not stop_event.is_set():
             t_start, t_end, b1, b2 = source.read_pair()
             writer.write_pair(seq, t_start, t_end, b1, b2)
             seq += 1
-            now = time.monotonic()
+            now = clock.now()
             if parent_pid and now - last_parent_check > 1.0:
                 last_parent_check = now
                 if os.getppid() != parent_pid:
@@ -54,11 +58,11 @@ def recorder_main(session_dir: str, source_spec: dict, bits_per_read: int,
                     # finalized the next time the app starts.
                     _log(log_path, "parent_gone", f"reads={seq}")
                     break
-            if time.monotonic() - last_stats > 10:
+            if clock.now() - last_stats > 10:
                 st = source.stats()
                 if st:
                     _log(log_path, "stats", repr(st))
-                last_stats = time.monotonic()
+                last_stats = clock.now()
         st = source.stats()
         _log(log_path, "stop", f"reads={seq} {st!r}" if st else f"reads={seq}")
     except Exception as e:  # recorded, and surfaced to the controller
@@ -83,10 +87,13 @@ class Recorder:
         self.stop_event = ctx.Event()
         self.ready_event = ctx.Event()
         self.error_event = ctx.Event()
+        self.ready_clock = ctx.Value("d", 0.0)
+        self.clock_offset = None
         self.process = ctx.Process(
             target=recorder_main,
             args=(session_dir, source_spec, bits_per_read,
-                  self.stop_event, self.ready_event, self.error_event, os.getpid()),
+                  self.stop_event, self.ready_event, self.error_event, os.getpid(),
+                  self.ready_clock),
             name="dualrng-recorder",
             daemon=False,
         )
@@ -99,6 +106,13 @@ class Recorder:
         if self.error_event.is_set():
             self.stop()
             raise RuntimeError("Recorder failed to start; see acq_log.csv")
+        # Read timestamps (recorder clock) are compared with block times (this
+        # process's clock). They must be the same clock: refuse to run if not.
+        self.clock_offset = clock.now() - self.ready_clock.value
+        if not -0.05 <= self.clock_offset <= 0.5:
+            self.stop()
+            raise RuntimeError(f"Recorder clock disagrees with this process by {self.clock_offset:.3f} s; "
+                               "block timing would be wrong")
 
     @property
     def failed(self) -> bool:

@@ -2,6 +2,7 @@ import os
 import time
 
 import numpy as np
+import pytest
 
 from dualrng.records import ReadsTailer, ReadsWriter, load_records, pair_records, unpack_bits
 from dualrng.recorder import Recorder
@@ -108,3 +109,60 @@ def test_probe_descriptions_on_synthetic_captures():
     ascii_stream = (",".join(str(v) for v in vals) + ",").encode()
     text = "\n".join(describe_unwhitened(ascii_stream))
     assert "even-position mean" in text and "contains '-' signs: False" in text
+
+
+def test_recorder_timestamps_use_the_parents_clock(tmp_path):
+    """Read timestamps come from the recorder process and block times from the
+    main process; they must be on one clock. (time.monotonic() is not shared
+    between processes on some macOS builds, which put reads seconds late.)"""
+    from dualrng import clock
+
+    # The faulty clock only showed up for processes spawned after the first, so
+    # start one recorder, wait, and check a second one (as the GUI does).
+    first = Recorder(str(tmp_path / "a"), {"kind": "sim", "reads_per_second": 50}, 256)
+    os.makedirs(tmp_path / "a")
+    first.start()
+    first.stop()
+    time.sleep(1.5)
+    os.makedirs(tmp_path / "b")
+    rec = Recorder(str(tmp_path / "b"), {"kind": "sim", "reads_per_second": 118, "seed": 4}, 1024)
+    rec.start()
+    assert rec.clock_offset is not None and -0.05 <= rec.clock_offset < 0.5
+    lags = []
+    for _ in range(5):
+        time.sleep(0.3)
+        recs = load_records(str(tmp_path / "b" / "reads.bin"))
+        lags.append(clock.now() - float(recs["t_end"].max()))
+    rec.stop()
+    assert max(lags) < 0.25, lags   # the newest read is current, not seconds old
+
+
+def test_live_trace_matches_block_measure(tmp_path):
+    """The trace is the cumulative per-read deviation against the REST lean; its
+    end divided by sqrt(reads) is the block z shown on screen."""
+    from dualrng.live import LiveFeedback
+
+    plan = [{"index": 0, "label": "REST", "start": 0.0, "end": 10.0},
+            {"index": 1, "label": "HIGH", "start": 10.0, "end": 20.0}]
+    path = tmp_path / "reads.bin"
+    w = ReadsWriter(str(path), 256)
+    rng = np.random.default_rng(8)
+    ones = []
+    for seq in range(200):
+        t = seq * 0.1 + 0.01
+        p = 0.48 if t < 10 else 0.52
+        b1 = (rng.random(256) < p).astype(np.uint8)
+        b2 = (rng.random(256) < p).astype(np.uint8)
+        w.write_pair(seq, t, t + 0.05, b1, b2)
+        ones.append((t, int(b1.sum() + b2.sum())))
+    w.close()
+    live = LiveFeedback(str(tmp_path), "intention", plan)
+    live.poll()
+    rest = [o for t, o in ones if t < 10]
+    p0 = sum(rest) / (512 * len(rest))
+    high = np.array([o for t, o in ones if t >= 10], dtype=float)
+    expect = np.cumsum((high - 512 * p0) / np.sqrt(512 * p0 * (1 - p0)))
+    tr = live.block_trace(1)
+    assert np.allclose(tr, expect)
+    assert live.block_z(1) == pytest.approx(expect[-1] / np.sqrt(len(expect)))
+    assert tr[-1] > 0   # the HIGH block really has more ones than REST

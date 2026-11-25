@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import clock
+
 TRUERNG_IDS = {
     "04D8:F5FE": "TrueRNG",
     "16D0:0AA0": "TrueRNGpro",
@@ -161,7 +163,7 @@ class HardwareSource:
                 "bytes_discarded": self.parser.bytes_discarded}
 
     def read_pair(self) -> tuple[float, float, np.ndarray, np.ndarray]:
-        t_start = time.monotonic()
+        t_start = clock.now()
         n = self.bits_per_read
         while len(self._pending1) < n:
             data = self._ser.read(self.chunk_bytes)
@@ -170,7 +172,7 @@ class HardwareSource:
             s1, s2 = self.parser.feed(data)
             self._pending1 = np.concatenate([self._pending1, (s1 & 1).astype(np.uint8)])
             self._pending2 = np.concatenate([self._pending2, (s2 & 1).astype(np.uint8)])
-        t_end = time.monotonic()
+        t_end = clock.now()
         b1, self._pending1 = self._pending1[:n], self._pending1[n:]
         b2, self._pending2 = self._pending2[:n], self._pending2[n:]
         return t_start, t_end, b1, b2
@@ -270,7 +272,7 @@ class SimSource:
         self._next_t = None
 
     def open(self) -> None:
-        self._next_t = time.monotonic()
+        self._next_t = clock.now()
 
     def describe(self) -> dict:
         return {"kind": self.kind, "model": self.model.to_dict(),
@@ -281,20 +283,20 @@ class SimSource:
 
     def read_pair(self):
         period = 1.0 / self.reads_per_second if self.reads_per_second > 0 else 0.0
-        t_start = time.monotonic()
+        t_start = clock.now()
         self._next_t += period
-        delay = self._next_t - time.monotonic()
+        delay = self._next_t - clock.now()
         if delay > 0:
             time.sleep(delay)
         else:
-            self._next_t = time.monotonic()
+            self._next_t = clock.now()
         if self._plan is None and self.session_dir:
             self._plan = load_plan(self.session_dir)
-        label = label_at(self._plan, (t_start + time.monotonic()) / 2)
+        label = label_at(self._plan, (t_start + clock.now()) / 2)
         p1, p2 = self.model.p_for_reads(np.array([label], dtype=object), self.bits_per_read, self.rng)
         b1 = (self.rng.random(self.bits_per_read) < p1[0]).astype(np.uint8)
         b2 = (self.rng.random(self.bits_per_read) < p2[0]).astype(np.uint8)
-        return t_start, time.monotonic(), b1, b2
+        return t_start, clock.now(), b1, b2
 
     def close(self) -> None:
         pass

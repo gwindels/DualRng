@@ -48,6 +48,26 @@ def test_headless_complete_session(tmp_path):
     assert "p_scan" not in open(os.path.join(tmp_path, "ledger.csv")).read()
 
 
+def test_injected_effect_lands_in_the_right_blocks(tmp_path):
+    """Through the real recorder process: a strong HIGH/LOW effect must show up
+    with the right sign. This only works if reads are assigned to the blocks
+    they were recorded in."""
+    out = subprocess.run([sys.executable, os.path.join(ROOT, "app.py"), "--base-dir", str(tmp_path),
+                          "run", "--type", "intention", "--source", "sim", "--block-seconds", "1.5",
+                          "--gap-seconds", "0.3", "--blocks-per-label", "3", "--sim-rate", "118",
+                          "--sim-delta", "0.01"],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    res = json.load(open(os.path.join(only_session(tmp_path), "results.json")))
+    p = res["primary"]
+    assert p["p_high"] - p["p_low"] > 0.015          # injected difference is 0.02
+    assert p["p"] == pytest.approx(1 / 20)          # the most extreme of the 20 assignments
+    for b in res["blocks"]:
+        if b["label"] in ("HIGH", "LOW") and b["used"]:
+            dev = (b["p1"] + b["p2"]) / 2 - p["lean"]["pooled"]
+            assert dev > 0 if b["label"] == "HIGH" else dev < 0, b
+
+
 def test_killed_session_is_recovered_on_next_start(tmp_path):
     proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "app.py"), "--base-dir", str(tmp_path),
                              "run", "--type", "intention", "--block-seconds", "2", "--gap-seconds", "0.2",
@@ -137,16 +157,14 @@ def _wait(cond, timeout=30):
 
 def test_gui_stop_button_saves_session(tmp_path, gui_env):
     def script(gui, click):
-        time.sleep(0.5)
-        cx, cy = gui.width // 2, gui.height // 2
-        click(cx, cy - 100)                       # Connection
-        time.sleep(0.2)
-        click(cx, cy + 20)                        # Start Session
+        press(gui, click, "connection")
+        press(gui, click, "start")
         assert _wait(lambda: gui.mode == "session")
         time.sleep(3.0)
-        click(30, gui.height - 20)                # Stop (arms)
+        assert gui.display == "wave"
+        press(gui, click, "stop")                 # arms
         time.sleep(0.3)
-        click(30, gui.height - 20)                # Stop (confirms)
+        press(gui, click, "stop")                 # confirms
         assert _wait(lambda: gui.mode == "idle")
         assert "Connection" in gui.summary
         gui.running = False
@@ -161,11 +179,8 @@ def test_gui_stop_button_saves_session(tmp_path, gui_env):
 
 def test_gui_quit_mid_session_still_saves(tmp_path, gui_env):
     def script(gui, click):
-        time.sleep(0.5)
-        cx, cy = gui.width // 2, gui.height // 2
-        click(cx + 230, cy - 100)                 # Sham on
-        time.sleep(0.2)
-        click(cx, cy + 20)                        # Start Session
+        press(gui, click, "sham")
+        press(gui, click, "start")
         assert _wait(lambda: gui.mode == "session")
         time.sleep(2.5)
         import pygame
@@ -177,6 +192,42 @@ def test_gui_quit_mid_session_still_saves(tmp_path, gui_env):
     rows = ledger_rows(tmp_path)
     assert len(rows) == 1 and rows[0]["condition"] == "sham"
     assert rows[0]["status"].startswith("stopped")
+
+
+def test_gui_intention_trace_display(tmp_path, gui_env):
+    seen = {}
+
+    def script(gui, click):
+        assert gui.session_type == "intention" and gui.feedback == "trace"
+        press(gui, click, "display")             # trace -> wave
+        assert _wait(lambda: gui.feedback == "wave")
+        press(gui, click, "display")             # wave -> trace
+        assert _wait(lambda: gui.feedback == "trace")
+        press(gui, click, "start")
+        assert _wait(lambda: gui.mode == "session")
+        assert gui.display == "trace"
+        # Wait until an aimed block has drawn a trace
+        assert _wait(lambda: gui.trace is not None and len(gui.trace) > 5 and gui.aim != 0, timeout=20)
+        seen["aim"] = gui.aim
+        seen["frac"] = gui.block_frac
+        assert _wait(lambda: gui.mode == "idle", timeout=60)  # session runs to completion
+        gui.running = False
+
+    _run_gui(tmp_path, script)
+    assert seen["aim"] in (1, -1) and 0 < seen["frac"] <= 1
+    d = only_session(tmp_path)
+    meta = json.load(open(os.path.join(d, "meta.json")))
+    assert meta["config"]["feedback"] == "trace" and meta["status"] == "complete"
+    rows = ledger_rows(tmp_path)
+    assert len(rows) == 1 and rows[0]["feedback"] == "trace"
+
+
+def press(gui, click, name, timeout=10):
+    """Click the centre of a button the GUI drew in its latest frame."""
+    assert _wait(lambda: name in gui.buttons, timeout=timeout), f"no {name} button"
+    r = gui.buttons[name]
+    click(r.centerx, r.centery)
+    time.sleep(0.3)
 
 
 def test_gui_close_display_is_idempotent(gui_env):

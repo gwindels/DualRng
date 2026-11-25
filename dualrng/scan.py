@@ -9,7 +9,13 @@ The p-value comes from a null built by circularly shifting one stream against
 the other, which keeps each stream's own structure (lean, drift,
 autocorrelation) and breaks only their alignment:
 
-* connection: u = z1 * z2; generator 2 is shifted against generator 1.
+* connection: u = z1 * z2 minus its session mean; generator 2 is shifted
+  against generator 1. Centering matters: a steady coupling between the
+  generators (the TrueRNGproV2 shows r ~ -0.01 between its two LSBs) is present
+  all session long, so it is not a local event, but shifting removes it from
+  the null while it stays in the data. Centering every series (observed and
+  shifted) on its own mean makes the scan look only for stretches where the
+  coupling departs from the session's usual level.
 * intention:  u = aim * z, with aim = +1 (HIGH), -1 (LOW), 0 otherwise and z the
   pooled per-read deviation; the aim sequence is shifted against the data.
 """
@@ -24,6 +30,10 @@ from datetime import datetime
 import numpy as np
 
 LABEL = "EXPLORATORY - not a pre-specified test; not part of the ledger"
+
+# Bumped whenever the scan statistic changes, and stored with every result.
+# 2: connection measure centered on its session mean.
+SCAN_VERSION = 2
 
 
 def _standardize(x: np.ndarray) -> np.ndarray:
@@ -46,6 +56,10 @@ def _scan(u: np.ndarray, windows: list) -> tuple[float, int, int]:
     return best
 
 
+def _centered(u: np.ndarray) -> np.ndarray:
+    return u - u.mean()
+
+
 def _windows_in_reads(window_seconds, read_seconds: float, n: int) -> list:
     ws = sorted({max(2, int(round(s / read_seconds))) for s in window_seconds})
     return [w for w in ws if w <= n // 2]
@@ -62,7 +76,7 @@ def run_scan(kind: str, a: np.ndarray, b: np.ndarray, window_seconds, read_secon
     rng = np.random.default_rng(seed)
     if kind == "connection":
         z1, z2 = _standardize(a), _standardize(b)
-        obs = _scan(z1 * z2, windows)
+        obs = _scan(_centered(z1 * z2), windows)
     elif kind == "intention":
         z = _standardize(a)
         aim = b.astype(float)
@@ -76,12 +90,12 @@ def run_scan(kind: str, a: np.ndarray, b: np.ndarray, window_seconds, read_secon
     for j in range(n_shifts):
         k = int(rng.integers(min_shift, n - min_shift + 1))
         if kind == "connection":
-            null[j] = _scan(z1 * np.roll(z2, k), windows)[0]
+            null[j] = _scan(_centered(z1 * np.roll(z2, k)), windows)[0]
         else:
             null[j] = _scan(np.roll(aim, k) * z, windows)[0]
     M, w, i = obs
     out = {
-        "label": LABEL, "kind": kind, "M": M,
+        "label": LABEL, "scan_version": SCAN_VERSION, "kind": kind, "M": M,
         "p_scan": float((1 + np.sum(null >= M)) / (1 + n_shifts)),
         "best_window_reads": int(w), "best_window_seconds": float(w * read_seconds),
         "best_start_index": int(i), "windows_reads": windows,
