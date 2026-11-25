@@ -1,495 +1,409 @@
-import serial
-import math
-import numpy as np
-import signal
-import time
-import gc  # Garbage collection
-import matplotlib
-import pandas as pd
-from pytz import timezone
-import os
-import csv
-matplotlib.use('Agg')  # Disable UI display (headless mode)
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import scipy.stats as stats
-from datetime import datetime
+#!/usr/bin/env python3
+"""DualRng command line.
+
+    python app.py --gui                      fullscreen GUI (pick session type on screen)
+    python app.py run --type intention       headless session (cues printed in the terminal)
+    python app.py run --type connection --sham
+    python app.py analyze --pending          finalize sessions left without results
+    python app.py report                     combined confirmatory report from the ledger
+    python app.py scan sessions/<id>         exploratory scan of one session
+    python app.py scan --legacy data         exploratory scan of pre-2.0 session CSVs
+    python app.py probe                      inspect what the device sends
+
+Add --source sim to any session command to run without hardware.
+"""
+from __future__ import annotations
+
 import argparse
-from netvar_calculator import NetVarCalculator
-from data_computer import DataComputer
-from plotter import Plotter
-from data_saver import DataSaver
-from sine_gui import SineGUI
-from color_theme import ColorTheme
-from rng_connector import Connector
-from multiscale_analyzer import MultiScaleAnalyzer
-from baseline_collector import BaselineCollector
+import json
+import os
+import signal
+import sys
+import threading
+import time
 
-class CoherenceAnalyzer:
-    def __init__(self, gui_mode=False, refresh_mm=0.1):
-        self.chunk_size = 1024  # Bytes per read
-        self.plot_interval = 60 * refresh_mm  # Refresh plot every X minutes
-        self.cst = timezone('US/Central')
-        self.start_time = datetime.now(self.cst).replace(tzinfo=None)
-        self.last_event_time = None
-        self.refresh_mm = refresh_mm
-        self.total_mm = 15 # Default to 15 minutes
-        self.data_dir = "data"
-        self.chart_dir = "charts"
-        self.plotter = Plotter(self.start_time, self.chart_dir)
-        self.data_saver = DataSaver(self.start_time, self.data_dir)
-        self.netvar_calculator = NetVarCalculator()
-        self.data_computer = DataComputer()
-        self.rng = Connector("MODE_UNWHITENED")
-        self.multiscale = MultiScaleAnalyzer()
-        self.baseline = BaselineCollector.load_baseline()
-        self.gui_mode = gui_mode
-        if self.gui_mode:
-            self.gui = SineGUI()
-        # Define NetVar gauge categories and colors
-        self.theme = ColorTheme()
-        self.color_ranges = self.theme.get_nvar_def()
-        self.show_summary = False
-        self.global_summary = None
-        self.session_data = []
-        self._stop_flag = False
-        os.chdir(os.path.dirname(os.path.abspath(__file__))) # Set the working directory to the script's location
-        os.makedirs(self.data_dir, exist_ok=True)
-        os.makedirs(self.chart_dir, exist_ok=True)
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 
-    def run_analysis(self, duration_minutes=None):
+from dualrng.analysis import finalize_pending, finalize_session, read_json, summarize  # noqa: E402
+from dualrng.live import LiveFeedback  # noqa: E402
+from dualrng.protocol import ProtocolConfig  # noqa: E402
+from dualrng.session import SessionRunner  # noqa: E402
 
-        if duration_minutes is not None:
-            self.total_mm = duration_minutes
-        duration_seconds = self.total_mm * 60
+DEFAULT_BASE = os.path.join(ROOT, "sessions")
 
-        z_scores_1, z_scores_2, stouffers_z, nvar, svar, timestamps = [], [], [], [], [], []
 
-        try:
-            self.rng.open()
-            start_time = time.time()
-            last_plot_time = start_time
-            self._stop_flag = False
+def ledger_path(args) -> str:
+    return os.path.join(args.base_dir, "ledger.csv")
 
-            while time.time() - start_time < duration_seconds:
-                if self._stop_flag:
-                    print("Trial stopped early.")
-                    break
-                try:
-                    bytes_per_ascii_sample = 5 # esimated 
-                    ascii_chunk_size = self.chunk_size * bytes_per_ascii_sample * 8  # x8 to convert to bits
 
-                    # Read from RNG1 (unwhitened)
-                    data1_raw = self.rng.read(ascii_chunk_size, "rng1")
-                    data1 = self.rng.extract_lsb_stream_from_ascii(data1_raw)
+def build_config(args, session_type: str, sham: bool) -> ProtocolConfig:
+    return ProtocolConfig(
+        session_type=session_type, sham=sham,
+        block_seconds=args.block_seconds, gap_seconds=args.gap_seconds,
+        blocks_per_label=args.blocks_per_label or 0, bits_per_read=args.bits_per_read,
+    )
 
-                    # Read from RNG2 (unwhitened)
-                    data2_raw = self.rng.read(ascii_chunk_size, "rng2")
-                    data2 = self.rng.extract_lsb_stream_from_ascii(data2_raw)
 
-                    if not data1 or not data2:
-                        print("Warning: Missing data. Retrying...")
-                        time.sleep(0.05)
-                        continue
+def source_spec(args) -> dict:
+    if args.source == "sim":
+        return {"kind": "sim", "lean": list(args.sim_lean), "intention_delta": args.sim_delta,
+                "shared_rho": args.sim_rho, "reads_per_second": args.sim_rate}
+    spec = {"kind": "hardware"}
+    if args.port:
+        spec["port"] = args.port
+    return spec
 
-                    z1 = self.rng.lsb_z_score(data1, chunk_size=self.chunk_size * 8) # x8 to convert bytes to bits
-                    z2 = self.rng.lsb_z_score(data2, chunk_size=self.chunk_size * 8)
-                    z_scores_1.append(z1)
-                    z_scores_2.append(z2)
-                    stouffers_z.append((z1 + z2) / math.sqrt(2))
-                    netvar = self.netvar_calculator.compute_netvar(stouffers_z[-1])
-                    scaled_netvar = self.netvar_calculator.scale_to_netvar(netvar)
-                    nvar.append(netvar)
-                    svar.append(scaled_netvar)
-                    timestamps.append(datetime.now())
 
-                    # Refresh data based on self.plot_interval
-                    if time.time() - last_plot_time > self.plot_interval:
-                        category = self.netvar_calculator.categorize_netvar(scaled_netvar)
-                        # self.save_plot(z_scores_1, z_scores_2, stouffers_z, timestamps, svar, category)
-                        self.update_data(z_scores_1, z_scores_2, stouffers_z, timestamps, svar, nvar, category)
-                        # self.plotter.plot_correlation(z_scores_1, z_scores_2, stouffers_z, timestamps, svar, category)
-                        # self.plotter.plot_histogram(z_scores_1, z_scores_2, stouffers_z, self.start_time)
-                        last_plot_time = time.time()
+def tally_color(theme, z: float):
+    # Same palette as the old NetVar categories, indexed by how unusual the block was.
+    defs = theme.get_nvar_def()
+    if z > 3.09:
+        return defs[4][3]
+    if z > 2.33:
+        return defs[3][3]
+    if z > 1.645:
+        return defs[2][3]
+    return defs[1][3]
 
-                    time.sleep(0.05)
 
-                except KeyboardInterrupt:
-                    print("\nProcess interrupted. Closing connection.")
-                    break  # Exit loop on Ctrl+C
-            
-            # Collect, combine, and save all current session data
-            self.session_data = [{
-                'timestamps': timestamps[i], 
-                'z_scores_1': z_scores_1[i], 
-                'z_scores_2': z_scores_2[i], 
-                'stouffers_z': stouffers_z[i], 
-                'nvar': nvar[i],
-                'svar': svar[i]
-            } for i in range(len(z_scores_1))] # merge arrays into session_data
-            self.data_saver.save_session_data(self.session_data) # save to csv
+def short_summary(result: dict, session_dir: str) -> str:
+    p = result.get("primary")
+    kind = f"{result.get('session_type', '').capitalize()} ({result.get('condition')}, {result.get('status')})"
+    if not p:
+        return f"{kind}: no result\n{result.get('error', '')}"
+    return (f"{kind}: p = {p['p']:.3f}, z = {p['z']:+.2f}\n"
+            f"Saved to sessions/{os.path.basename(session_dir)}")
 
-        except Exception as e:
-            print(f"Analysis Error: {e}")
-        finally:
-            self.rng.close()
 
-        return np.array(z_scores_1), np.array(z_scores_2), timestamps, np.array(nvar)
+# ----------------------------------------------------------------------
+# GUI controller
+# ----------------------------------------------------------------------
+
+class Controller:
+    """Owns the session; the GUI calls tick() every frame and start/stop on taps."""
+
+    def __init__(self, gui, args):
+        self.gui = gui
+        self.args = args
+        self.runner = None
+        self.live = None
+        self.worker = None
+        self._last_poll = 0.0
+        self._last_index = None
+        self.selection_changed(gui.session_type, gui.sham)
+
+    def selection_changed(self, session_type, sham):
+        cfg = build_config(self.args, session_type, sham)
+        self.gui.plan_text = (f"{cfg.n_blocks} blocks x {cfg.block_seconds:g} s  "
+                              f"({' / '.join(cfg.labels)})  ~{cfg.duration_seconds / 60:.0f} min"
+                              + ("  no cues" if sham else ""))
+
+    def start(self, session_type, sham):
+        if self.worker and self.worker.is_alive():
+            return
+        self.gui.mode = "starting"
+        cfg = build_config(self.args, session_type, sham)
+
+        def job():
+            runner = SessionRunner(cfg, self.args.base_dir, source_spec(self.args), ledger_path(self.args))
+            try:
+                runner.start()
+            except Exception as e:
+                if runner.dir:
+                    runner.stop(early=True)
+                    finalize_session(runner.dir, ledger_path(self.args), make_plots=False)
+                self.gui.summary = f"Could not start: {e}"
+                self.gui.mode = "idle"
+                return
+            self.live = LiveFeedback(runner.dir, cfg.session_type, runner.plan)
+            self._last_index = None
+            self.runner = runner
+            self.gui.mode = "session"
+
+        self.worker = threading.Thread(target=job, daemon=True)
+        self.worker.start()
+
+    def _block_value(self, index):
+        z = self.live.block_z(index)
+        if z is None:
+            return None
+        return z if self.runner.config.session_type == "intention" else abs(z)
+
+    def tick(self):
+        r = self.runner
+        if self.gui.mode != "session" or r is None:
+            return
+        now = time.monotonic()
+        if now - self._last_poll > 0.25:
+            self.live.poll()
+            self._last_poll = now
+        st = r.state(now)
+        sham = r.config.sham
+        g = self.gui
+        n = st.get("n_blocks", len(r.plan))
+        if st["phase"] == "done":
+            self._close_block()
+            self.finish(early=False)
+            return
+        idx = st["index"]
+        if st["phase"] == "block" and self._last_index is not None and idx != self._last_index:
+            self._close_block()
+        if st["phase"] == "gap" and self._last_index is not None:
+            self._close_block()
+        g.progress = f"Block {idx + 1}/{n}"
+        if sham:
+            g.cue, g.cue_dim, g.feedback, g.coherence = "CONTROL", True, "", 0.0
+        elif st["phase"] == "gap":
+            g.cue, g.cue_dim, g.feedback, g.coherence = f"Next: {st['cue']}", True, "", 0.0
+        else:
+            self._last_index = idx
+            g.cue, g.cue_dim = st["cue"], False
+            v = self._block_value(idx)
+            raw = self.live.block_z(idx)
+            g.feedback = "" if raw is None else f"z {raw:+.2f}"
+            g.coherence = 0.0 if v is None else max(0.0, min(1.0, v / 2.5))
+        if not r.recorder_ok():
+            g.status = "Recorder stopped - see acq_log.csv"
+        elif self.live.last_read_mono is not None and now - self.live.last_read_mono > 3:
+            g.status = f"No data for {now - self.live.last_read_mono:.0f} s"
+        else:
+            g.status = ""
+
+    def _close_block(self):
+        """Called once when a real block ends: add a tally circle if it went the intended way."""
+        if self._last_index is None or self.runner is None:
+            return
+        idx, self._last_index = self._last_index, None
+        if self.runner.config.sham:
+            return
+        self.live.poll()
+        v = self._block_value(idx)
+        if v is not None and v > 1.0:
+            self.gui.add_tally(tally_color(self.gui.theme, v))
 
     def stop(self):
-        self._stop_flag = True
+        if self.gui.mode == "session":
+            self.finish(early=True)
 
-    def label_coherence_strength(self, r):
-        abs_r = abs(r)
-        if abs_r < 0.1:
-            return "Negligible"
-        elif abs_r < 0.3:
-            return "Mild"
-        elif abs_r < 0.5:
-            return "Moderate"
-        elif abs_r < 0.7:
-            return "Strong"
-        elif abs_r < 0.9:
-            return "Very Strong"
-        else:
-            return "Near Perfect"
-
-    def update_data(self, z1, z2, stouffers_z, timestamps, netvar, nvar_raw, category):
-        if len(z1) == 0 or len(z2) == 0: print("No data available, skipping update_data"); return
-
-        # Group data into bins for plotting and analysis
-        # nvar_raw (per-sample Z²) is binned alongside so mean(Z²) preserves E=1 under H0
-        timestamps_binned, smoothed_values = self.data_computer.aggregate_data_by_time(
-            timestamps, z1, z2, stouffers_z, netvar, nvar_raw, time_window="2s"
-        )
-        if not timestamps_binned: print("Warning: No valid timestamps after binning."); return
-        # Store smoothed values individually
-        smoothed_z1, smoothed_z2, smoothed_stouf, smoothed_nv, smoothed_nv_raw = smoothed_values
-        # Ensure timestamps_binned and smoothed_nv have the same length
-        min_length = min(len(timestamps_binned), len(smoothed_nv))
-        timestamps_binned = timestamps_binned[:min_length]
-        smoothed_nv = smoothed_nv[:min_length]
-        smoothed_nv_raw = smoothed_nv_raw[:min_length]
-        smoothed_z1 = smoothed_z1[:min_length]
-        smoothed_z2 = smoothed_z2[:min_length]
-        smoothed_stouf = smoothed_stouf[:min_length]
-        # Calculate rolling values
-        stouf_rolling = pd.Series(smoothed_stouf, index=timestamps_binned).rolling(window=5, min_periods=1).mean()
-
-        # -- Run multi-scale analysis --
-        multiscale_results = self.multiscale.analyze(timestamps_binned, smoothed_z1, smoothed_z2)
-        netvar_multiscale_results = self.multiscale.analyze_netvar(timestamps_binned, smoothed_nv_raw)
-
-        # -- Plot netvar and histogram charts --
-        self.plotter.plot_netvar(smoothed_z1, smoothed_z2, smoothed_stouf, stouf_rolling, timestamps_binned, smoothed_nv, category)
-        self.plotter.plot_multiscale_netvar_scaled(timestamps_binned, smoothed_nv, self.multiscale.window_scales)
-        # self.plotter.plot_histogram(z1, z2, stouffers_z, self.start_time)
-
-        # -- Compute rolling correlation (primary 10-sample window) --
-        df = pd.DataFrame({"timestamp": timestamps_binned, "z1": smoothed_z1, "z2": smoothed_z2})
-        df.set_index("timestamp", inplace=True)
-        df["rolling_corr"] = df["z1"].rolling(10, min_periods=1).corr(df["z2"])  # Rolling correlation
-        df["rolling_corr_ma"] = df["rolling_corr"].rolling(20).mean() # Moving Average
-        valid_corr = df["rolling_corr"].dropna()
-        valid_corr = valid_corr[(valid_corr > -1) & (valid_corr < 1)]  # Ensure valid range
-        
-        # Only continue with correlation if there are enough values
-        if valid_corr.empty: 
-            # -- Only update nvar on screen
-            if self.gui_mode:
-                self.gui.set_coherence(0, smoothed_nv[-1])
-            # Don't go further
-            print("No valid correlation values after filtering.")
+    def finish(self, early):
+        runner, self.runner = self.runner, None
+        if runner is None:
             return
+        self.gui.mode = "finishing"
 
-        valid_corr = valid_corr.clip(-0.9999, 0.9999)  # Prevent division by zero
-        z_values = 0.5 * np.log((1 + valid_corr) / (1 - valid_corr))
-        p_values = self.data_computer.compute_p_value(z_values, window_size=10)
-        effect_sizes = np.abs(z_values)
-        # Store latest correlation value for display
-        last_value = valid_corr.iloc[-1]
-
-        # -- Identify significant events --
-        # Ensure `significance_threshold` is a Pandas Series aligned with `df.index`
-        significance_threshold = pd.Series((p_values < 0.05) & (effect_sizes > 0.5), index=valid_corr.index)
-        # Reindex `significance_threshold` to match `df.index`, filling missing values with False
-        significance_threshold = significance_threshold.reindex(df.index, fill_value=False)
-        # Correctly filter `df` using the aligned boolean mask
-        significant_points = df[significance_threshold]
-        # Convert P values and Effect Sizes to Panda series to support loc
-        p_values = pd.Series(p_values, index=valid_corr.index)
-        effect_sizes = pd.Series(effect_sizes, index=valid_corr.index)
-        # Define minimum logging time threshold
-        min_log_time = pd.Timestamp(self.start_time).tz_localize(None) + pd.Timedelta(seconds=10)
-        # Filter points down to 10 second or later to avoid early noise
-        filtered_points = significant_points[significant_points.index > min_log_time]
-        should_announce = False
-        if self.last_event_time is not None:
-            last_ts = pd.Timestamp(self.last_event_time).tz_localize(None)
-            new_events = filtered_points[filtered_points.index > last_ts]
-            if not new_events.empty:
-                should_announce = True
-                most_recent = new_events.index[-1]
-        else:
-            # First run — consider the latest filtered event new
-            if not filtered_points.empty:
-                should_announce = True
-                most_recent = filtered_points.index[-1]
-        # Store events in a list
-        significant_events = [
-            {
-                "timestamp": index,
-                "correlation": row["rolling_corr"],
-                "p_value": p_values.loc[index],
-                "effect_size": effect_sizes.loc[index]
-            }
-            for index, row in filtered_points.iterrows()
-        ]
-        if significant_events:
-            # Save to CSV
-            self.data_saver.save_significant_events(significant_events)
-            if should_announce:
-                print(f"New significant event at {most_recent}")
-                # if self.gui_mode:
-                    # self.gui.trigger_flash()
-                self.last_event_time = pd.Timestamp(most_recent).tz_localize(None)
-
-        # -- Track whether the trial as a whole is significant
-        p_empirical = None
-        Z_global, p_global = self.data_computer.compute_global_trial_significance(valid_corr)
-        if Z_global is not None:
-            # Empirical p-value if baseline is available
-            p_empirical = None
-            if self.baseline is not None and "corr_20s" in self.baseline:
-                p_empirical = self.data_computer.bootstrap_trial_p_value(
-                    Z_global, self.baseline["corr_20s"], len(valid_corr)
-                )
-
-            # Bayes Factor
-            bf10 = self.data_computer.bayes_factor_z(Z_global, len(valid_corr))
-
-            # Correlation confidence interval
-            mean_corr = valid_corr.mean()
-            ci_lower, ci_upper = self.data_computer.correlation_confidence_interval(
-                mean_corr, len(valid_corr)
-            )
-
-            # Multi-scale significance summary
-            scale_summary = self.multiscale.get_scale_summary()
-            sig_scales = [name for name, s in scale_summary.items() if s["n_significant"] > 0]
-            strongest = self.multiscale.get_strongest_event()
-
-            # FDR-corrected event count
-            all_ms_events = self.multiscale.get_significant_events()
-            n_fdr_events = len(all_ms_events)
-
-            # Enhanced console summary
-            elapsed = (timestamps_binned[-1] - timestamps_binned[0]).total_seconds() / 60 if len(timestamps_binned) > 1 else 0
-            print(f"\nTrial Summary ({elapsed:.0f} min)")
-            print(f"   Global Z: {Z_global:.3f}, p: {p_global:.4f} (theoretical)", end="")
-            if p_empirical is not None:
-                print(f", p: {p_empirical:.4f} (bootstrap)", end="")
-            print()
-            print(f"   Bayes Factor (BF10): {bf10:.2f}")
-            print(f"   Mean correlation: {mean_corr:.4f} [{ci_lower:.4f}, {ci_upper:.4f}]")
-            if sig_scales:
-                scale_details = []
-                for name in sig_scales:
-                    s = scale_summary[name]
-                    scale_details.append(f"{name} ({s['n_significant']} events, min p={s['min_p_value']:.4f})")
-                print(f"   Significant scales: {', '.join(scale_details)}")
-            else:
-                print(f"   Significant scales: none")
-            if strongest:
-                print(f"   Strongest event: {strongest['timestamp']} at {strongest['scale']} scale "
-                      f"(r={strongest['correlation']:.4f}, p={strongest['p_value']:.6f})")
-            print(f"   Events: {n_fdr_events} survived FDR correction")
-
-            if p_global < 0.05:
-                self.global_summary = f"Statistically significant {self.total_mm} minute trial"
-            elif p_global < 0.1:
-                self.global_summary = f"{self.total_mm} minute trial approached significance"
-            else:
-                self.global_summary = f"{self.total_mm} minute trial complete"
-            print(f"   {self.global_summary}.")
-
-        # Check whether rolling average is available
-        rolling_ma = df["rolling_corr_ma"].dropna()
-        if rolling_ma.empty: 
-            if self.gui_mode:
-                # -- Only update nvar and raw_coherence
-                self.gui.set_coherence(0, nvar=smoothed_nv[-1], raw_coherence=last_value)
-            # Don't go further
-            print("Not enough data for rolling avg.")
-            return
-        
-        r_ma = rolling_ma.iloc[-1]
-        z_ma = self.data_computer.fisher_z_transform(r_ma)
-        p_ma = self.data_computer.compute_p_value(z_ma)
-        coherence_strength = round(min(1.0, abs(r_ma)), 3)
-        coherence_label = self.label_coherence_strength(r_ma)
-
-        print(f"Rolling correlation MA (r): {round(r_ma, 4)}")
-        print(f"   z: {round(z_ma, 4)}")
-        print(f"   p-value: {round(p_ma, 4)}")
-        print(f"   Significance: {coherence_label}")
-        print(f"   Coherence strength: {coherence_strength}")
-
-        # -- Update the GUI
-        if self.gui_mode:
-            self.gui.set_coherence((coherence_strength * 2), nvar=smoothed_nv[-1], raw_coherence=last_value)
-            self.gui.set_z_global(self.global_summary)
-
-        # -- Plot rolling correlation and save raw data to CSV --
-        trial_stats = {
-            "scale_summary": self.multiscale.get_scale_summary(),
-            "bf10": self.data_computer.bayes_factor_z(
-                Z_global, len(valid_corr)
-            ) if Z_global is not None else None,
-            "p_empirical": p_empirical if Z_global is not None else None,
-        }
-        self.plotter.plot_rolling_correlation(
-            df, significant_points, self.global_summary,
-            baseline=self.baseline, trial_stats=trial_stats
-        )
-        self.data_saver.save_correlation_values(df)
-
-        # -- Plot multi-scale correlation and save events --
-        if multiscale_results:
-            self.plotter.plot_multiscale_correlation(multiscale_results)
-            ms_events = self.multiscale.get_significant_events()
-            if ms_events:
-                self.data_saver.save_multiscale_events(ms_events)
-
-        # -- Plot multi-scale NetVar --
-        if netvar_multiscale_results:
-            self.plotter.plot_multiscale_netvar(netvar_multiscale_results)
-            nv_scale_summary = self.multiscale.get_netvar_scale_summary()
-            nv_sig_scales = [name for name, s in nv_scale_summary.items() if s["n_significant"] > 0]
-            if nv_sig_scales:
-                nv_details = []
-                for name in nv_sig_scales:
-                    s = nv_scale_summary[name]
-                    nv_details.append(f"{name} ({s['n_significant']} events, min p={s['min_p_value']:.4f})")
-                print(f"   NetVar significant scales: {', '.join(nv_details)}")
-            else:
-                print(f"   NetVar significant scales: none")
-
-    def reset_trial(self):
-        print("Resetting analyzer state for new trial...")
-        self.start_time = datetime.now(self.cst).replace(tzinfo=None)
-        self.last_event_time = None
-        self.session_data = []
-        self.global_summary = None
-        self.plotter.reset(self.start_time)
-        self.data_saver.reset(self.start_time)
-        self.netvar_calculator.reset()
-
-        if self.gui_mode:
-            self.gui.reset()
-
-
-# --- Helpers to cleanly manage lifecycle of application ---
-
-def graceful_shutdown(analyzer, analysis_thread=None):
-    """Stop analysis, join the worker, close GUI, close plots."""
-    try:
-        analyzer.stop()  # sets _stop_flag so long loops exit
-        if analysis_thread and analysis_thread.is_alive():
-            analysis_thread.join(timeout=5.0)
-    finally:
-        # If GUI is being used, stop it (this calls SineGUI._close_display())
-        if getattr(analyzer, "gui_mode", False) and hasattr(analyzer, "gui"):
-            analyzer.gui.stop()
-        # Close any open figures
-        try:
-            import matplotlib.pyplot as plt
-            plt.close('all')
-        except Exception:
-            pass
-        # Optional: if your Connector has a close(), do it
-        if hasattr(analyzer, "rng") and hasattr(analyzer.rng, "close"):
+        def job():
+            runner.stop(early=early)
             try:
-                analyzer.rng.close()
+                result = runner.finalize()
+                self.gui.summary = short_summary(result, runner.dir)
+            except Exception as e:
+                self.gui.summary = f"Analysis failed ({e}); data saved in {runner.dir}"
+            self.gui.mode = "idle"
+
+        self.worker = threading.Thread(target=job, daemon=False)
+        self.worker.start()
+
+    def shutdown(self):
+        """Called when the GUI exits for any reason: never leave a session unsaved."""
+        if self.runner is not None:
+            try:
+                self.gui.draw_message("Saving session...")
+                import pygame
+                pygame.display.flip()
             except Exception:
                 pass
+            self.finish(early=True)
+        if self.worker is not None and self.worker.is_alive():
+            self.worker.join(timeout=120)
 
-def _signal_handler(signum, frame, analyzer_ref=None, analysis_thread_ref=None):
-    if analyzer_ref:
-        self.graceful_shutdown(analyzer_ref, analysis_thread_ref)
+
+def cmd_gui(args):
+    from sine_gui import SineGUI
+
+    gui = SineGUI(fullscreen=not args.windowed)
+    controller = Controller(gui, args)
+    gui.controller = controller
+
+    def on_signal(signum, frame):
+        gui.running = False
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    def pending():
+        for d, res in finalize_pending(args.base_dir, ledger_path(args)):
+            print(f"Finalized earlier session {os.path.basename(d)}: {summarize(res)}")
+    threading.Thread(target=pending, daemon=True).start()
+    gui.run()
+
+
+# ----------------------------------------------------------------------
+# Headless session
+# ----------------------------------------------------------------------
+
+def cmd_run(args):
+    for d, res in finalize_pending(args.base_dir, ledger_path(args)):
+        print(f"Finalized earlier session {os.path.basename(d)}: {summarize(res)}")
+    cfg = build_config(args, args.type, args.sham)
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda s, f: stop.set())
+    signal.signal(signal.SIGTERM, lambda s, f: stop.set())
+
+    runner = SessionRunner(cfg, args.base_dir, source_spec(args), ledger_path(args))
+    runner.start()
+    live = LiveFeedback(runner.dir, cfg.session_type, runner.plan)
+    print(f"Session {runner.session_id}: {cfg.n_blocks} blocks x {cfg.block_seconds:g} s, "
+          f"~{cfg.duration_seconds / 60:.1f} min. Ctrl-C stops early (the session is still saved).")
+    print(f"Pre-specified statistic: {cfg.primary_statistic} ({cfg.tail})")
+    last = None
+    early = False
+    try:
+        while not runner.done():
+            if stop.wait(0.2):
+                early = True
+                break
+            live.poll()
+            st = runner.state()
+            key = (st["phase"], st.get("index"))
+            if key != last and st["phase"] in ("gap", "block"):
+                i, n = st["index"] + 1, st["n_blocks"]
+                if st["phase"] == "block":
+                    print(f"[{i}/{n}] " + ("block" if cfg.sham else st["cue"]), flush=True)
+                elif last is not None and last[0] == "block" and not cfg.sham:
+                    z = live.block_z(last[1])
+                    if z is not None:
+                        print(f"       block z {z:+.2f}", flush=True)
+                last = key
+            if not runner.recorder_ok():
+                print("Recorder stopped; ending session. See acq_log.csv.")
+                break
+    finally:
+        runner.stop(early=early)
+        result = runner.finalize()
+        print("\n" + summarize(result))
+        ex = os.path.join(runner.dir, "exploratory.json")
+        if os.path.exists(ex):
+            e = read_json(ex)
+            if "p_scan" in e:
+                print(f"Exploratory scan (not confirmatory): M {e['M']:.2f}, p_scan {e['p_scan']:.3f}")
+        print(f"Saved in {runner.dir}")
+
+
+# ----------------------------------------------------------------------
+# Analysis commands
+# ----------------------------------------------------------------------
+
+def cmd_analyze(args):
+    if args.pending:
+        done = finalize_pending(args.base_dir, ledger_path(args))
+        if not done:
+            print("No sessions waiting for analysis.")
+        for d, res in done:
+            print(f"{os.path.basename(d)}: {summarize(res)}")
+    for d in args.sessions:
+        res = finalize_session(d, ledger_path(args), force=args.force)
+        print(f"{os.path.basename(os.path.normpath(d))}: {summarize(res)}")
+
+
+def cmd_report(args):
+    from dualrng.ledger import format_report
+    print(format_report(ledger_path(args), complete_only=args.complete_only))
+
+
+def cmd_scan(args):
+    from dualrng.scan import format_legacy, legacy_scan
+    if args.legacy:
+        res = legacy_scan(args.legacy, n_shifts=args.shifts)
+        text = format_legacy(res)
+        print(text)
+        if args.out:
+            with open(args.out, "w") as f:
+                f.write(text + "\n")
+        return
+    from dualrng.analysis import exploratory, load_session_arrays
+    for d in args.sessions:
+        meta = read_json(os.path.join(d, "meta.json"))
+        cfg = ProtocolConfig.from_dict(meta["config"])
+        cfg.scan_shifts = args.shifts
+        reads, plan = load_session_arrays(d)
+        import numpy as np
+        rs = float(np.median(reads["t_end"] - reads["t_start"]))
+        print(os.path.basename(os.path.normpath(d)))
+        print(json.dumps(exploratory(cfg, reads, plan, rs), indent=2))
+
+
+def cmd_probe(args):
+    from dualrng.probe import run_probe
+    print(run_probe(os.path.join(ROOT, "probe")))
+
+
+# ----------------------------------------------------------------------
+
+def add_session_args(p):
+    p.add_argument("--block-seconds", type=float, default=30.0)
+    p.add_argument("--gap-seconds", type=float, default=3.0)
+    p.add_argument("--blocks-per-label", type=int, default=0,
+                   help="blocks of each label (default 8 for intention, 12 for connection)")
+    p.add_argument("--bits-per-read", type=int, default=1024)
+    p.add_argument("--source", choices=("hardware", "sim"), default="hardware")
+    p.add_argument("--port", help="serial port (default: first TrueRNG found)")
+    p.add_argument("--sim-lean", type=float, nargs=2, default=(0.4992, 0.4992), metavar=("P1", "P2"))
+    p.add_argument("--sim-delta", type=float, default=0.0,
+                   help="simulated intention effect: added to p(1) in HIGH, subtracted in LOW")
+    p.add_argument("--sim-rho", type=float, default=0.0,
+                   help="simulated shared signal: correlation of per-read z in CONNECT blocks")
+    p.add_argument("--sim-rate", type=float, default=50.0, help="simulated reads per second")
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--gui" in argv:  # backwards compatible: python app.py --gui
+        argv.remove("--gui")
+        argv.insert(0, "gui")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--base-dir", default=DEFAULT_BASE, help="where sessions and the ledger live")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("gui", help="fullscreen GUI")
+    add_session_args(p)
+    p.add_argument("--windowed", action="store_true")
+    p.set_defaults(func=cmd_gui)
+
+    p = sub.add_parser("run", help="headless session")
+    add_session_args(p)
+    p.add_argument("--type", choices=("intention", "connection"), required=True)
+    p.add_argument("--sham", action="store_true", help="no cues; control session")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("analyze", help="finalize sessions")
+    p.add_argument("sessions", nargs="*")
+    p.add_argument("--pending", action="store_true", help="finalize every session without results")
+    p.add_argument("--force", action="store_true", help="recompute results.json (the ledger row is not changed)")
+    p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser("report", help="combined confirmatory report")
+    p.add_argument("--complete-only", action="store_true")
+    p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("scan", help="EXPLORATORY scan")
+    p.add_argument("sessions", nargs="*")
+    p.add_argument("--legacy", metavar="DIR", help="scan pre-2.0 session_*.csv files in DIR")
+    p.add_argument("--shifts", type=int, default=1000)
+    p.add_argument("--out", help="also write the legacy table to this file")
+    p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("probe", help="inspect the device's raw output")
+    p.set_defaults(func=cmd_probe)
+
+    args = parser.parse_args(argv)
+    if not args.cmd:
+        parser.print_help()
+        return 1
+    args.base_dir = os.path.abspath(args.base_dir)
+    os.makedirs(args.base_dir, exist_ok=True)
+    return args.func(args) or 0
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run script in CLI or GUI mode")
-    parser.add_argument("--gui", action="store_true", help="Launch GUI mode")
-    parser.add_argument("--duration", type=int, help="Duration to run the analysis in minutes (default: 15)")
-    parser.add_argument("--baseline", action="store_true", help="Run in baseline collection mode (no GUI)")
-    parser.add_argument("--baseline-sessions", type=int, default=5, help="Number of baseline sessions to collect (default: 5)")
-    args = parser.parse_args()
-
-    if args.baseline:
-        collector = BaselineCollector()
-        duration = args.duration if args.duration else 5
-        collector.collect(duration_minutes=duration, num_sessions=args.baseline_sessions)
-        exit(0)
-
-    print(f"args.gui = {args.gui}")
-    print(f"args.duration = {args.duration}")
-
-    if args.gui:
-        import threading
-
-        analyzer = CoherenceAnalyzer(gui_mode=True)
-        trial_active = threading.Event()
-        analysis_thread = None  # track the current analysis run thread
-
-        def start_new_trial():
-            global analysis_thread
-            if trial_active.is_set():
-                print("Trial already running.")
-                return
-            trial_active.set()
-
-            def analysis_job():
-                try:
-                    analyzer.run_analysis(duration_minutes=analyzer.gui.duration_minutes)
-                finally:
-                    trial_active.clear()
-                    analyzer.gui.is_idle = True  # back to idle when done
-
-            analyzer.reset_trial()
-            analysis_thread = threading.Thread(target=analysis_job, daemon=False)  # not daemon → let us join
-            analysis_thread.start()
-
-        analyzer.gui.on_start_trial = start_new_trial
-        analyzer.gui.is_idle = True  # Start with the idle screen
-
-        if args.duration:
-            analyzer.gui.duration_minutes = args.duration
-            analyzer.gui.duration_text = str(args.duration)
-
-        # Hook signals now that we have objects
-        signal.signal(signal.SIGINT,  lambda s, f: _signal_handler(s, f, analyzer, analysis_thread))
-        signal.signal(signal.SIGTERM, lambda s, f: _signal_handler(s, f, analyzer, analysis_thread))
-
-        try:
-            # Run the GUI loop in the main thread so OS signals are delivered there
-            analyzer.gui.run()
-        except KeyboardInterrupt:
-            print("Interrupted. Exiting cleanly.")
-        finally:
-            graceful_shutdown(analyzer, analysis_thread)
-
-    else:
-        # Headless mode — no GUI
-        analyzer = CoherenceAnalyzer(gui_mode=False)
-
-        # Hook signals to stop long loops
-        signal.signal(signal.SIGINT,  lambda s, f: _signal_handler(s, f, analyzer, None))
-        signal.signal(signal.SIGTERM, lambda s, f: _signal_handler(s, f, analyzer, None))
-
-        try:
-            analyzer.run_analysis(duration_minutes=args.duration)
-        except KeyboardInterrupt:
-            print("Interrupted. Exiting cleanly.")
-        finally:
-            graceful_shutdown(analyzer, None)
+    sys.exit(main())

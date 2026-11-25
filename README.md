@@ -1,230 +1,269 @@
-# DualRead — RNG Coherence Analyzer
+# DualRng
 
-Analyzes correlation between two independent unwhitened TrueRNG streams using Z-scores, rolling correlation, multi-scale analysis, and Bayesian inference.
+DualRng runs controlled experiments on the two hardware random number generators inside a TrueRNGpro, on a Raspberry Pi with a touchscreen. It asks two questions:
+
+1. **Intention.** Can one person shift the generators toward more 1s or more 0s when asked to?
+2. **Connection.** When two people try to connect, do the two generators become more correlated with each other?
+
+Every session follows a protocol that is fixed before any data arrives: randomized blocks, one statistic chosen in advance, and a permutation test for its p-value. Each session adds one row to a ledger. A report combines the ledger rows, keeping real sessions and sham (control) sessions separate. A multi-scale scan is still available, but it is clearly marked exploratory and never feeds the ledger.
+
+---
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt          # numpy, scipy, matplotlib, pyserial, pygame
+pip install -r requirements-dev.txt      # adds pytest
 ```
 
-## Running a Trial
+The versions in `requirements.txt` are the ones used on the Pi. The code also runs on Python 3.9 with numpy 2.0, scipy 1.13, matplotlib 3.9 and pygame 2.6, which is how the test suite was run during development.
 
-### GUI mode
+## Running sessions
+
+### GUI (touchscreen)
 
 ```bash
 python app.py --gui
-python app.py --gui --duration 20
+python app.py --gui --block-seconds 20 --blocks-per-label 10
+python app.py --gui --source sim            # no hardware needed
 ```
 
-The idle screen shows a duration input field (default 15 minutes), a **New Trial** button, and a **Quit** button. Click the duration field, type a number, then click **New Trial**. The `--duration` flag sets the initial value but can be changed in the GUI before each trial.
+On the idle screen, choose **Intention** or **Connection** and turn **Sham** on or off, then tap **Start Session**. The line under the buttons shows the block plan and the total duration. The summary at the top shows the result of the last session.
 
-During a trial the screen shows:
-- An animated sine wave whose complexity and color reflect coherence strength
-- **GCP** (NetVar) value and category label (top corners)
-- **Cor** (rolling correlation) value (bottom-right)
-- Colored tally circles for each significant NetVar spike
-- Full-screen flash when an extreme NetVar event occurs
+During a session:
 
-Double-tap to exit fullscreen. Press Escape to toggle windowed mode or quit.
+| Where | What |
+|---|---|
+| Top left | The cue for the current block: **AIM HIGH**, **AIM LOW**, **CONNECT** or **REST**. Between blocks it shows the next cue, dimmed. |
+| Top right | Block progress (`Block 5/24`) |
+| Wave | Live feedback. It grows calmer and brighter as the current block's measure moves the intended way (see "Live feedback"). |
+| Bottom right | The current block's z (see "Live feedback") |
+| Bottom center | Circles for completed blocks that went the intended way (z > 1). The colour shows how strongly: purple > 1, orange > 1.645, yellow > 2.33, pink > 3.09. |
+| Bottom left | **Stop**. Tap it twice within 3 seconds to end the session early. |
 
-### Headless mode
+A sham session shows **CONTROL**, the block progress, and a dimmed wave that does not respond. It shows no cues and no feedback.
+
+Double-tap the screen to leave fullscreen, and press Escape to quit. **However the session ends** (it finishes, you tap Stop, you quit, the window closes, or the app gets Ctrl-C or SIGTERM), the session is stopped, analyzed and added to the ledger. If the program is killed or the Pi loses power, the data recorded up to that point is already on disk. That session is analyzed the next time the app starts.
+
+### Headless
 
 ```bash
-python app.py
-python app.py --duration 30
+python app.py run --type intention
+python app.py run --type connection --sham
+python app.py run --type intention --source sim --sim-delta 0.0005   # simulated, with an injected effect
 ```
 
-Runs without a GUI. Stats print to the console every ~6 seconds. Ctrl-C stops the trial early.
+Cues print in the terminal as each block starts. Ctrl-C stops the session early, and the session is still saved and analyzed.
 
-### Baseline collection
+### Other commands
 
 ```bash
-python app.py --baseline --duration 5 --baseline-sessions 10
+python app.py report                    # combined results from the ledger
+python app.py report --complete-only    # leave out sessions that were stopped or interrupted
+python app.py analyze --pending         # analyze sessions left without results (e.g. after a crash)
+python app.py scan sessions/<id>        # EXPLORATORY scan of one session
+python app.py scan --legacy data        # EXPLORATORY scan of the pre-2.0 session CSVs
+python app.py probe                     # check what the device actually sends (see "Hardware")
 ```
 
-Records null-hypothesis data (no intention) across multiple short sessions. Produces `baseline/null_distributions.npz`, which later trials use to compute bootstrap p-values. Collect baseline before running real trials for the most rigorous analysis.
+The protocol options apply to `gui` and `run`: `--block-seconds` (default 30), `--gap-seconds` (default 3), `--blocks-per-label` (default 8 for intention, 12 for connection) and `--bits-per-read` (default 1024). The simulator options are `--sim-lean P1 P2`, `--sim-delta`, `--sim-rho` and `--sim-rate`.
 
-Rebuild distributions from existing session files:
+---
 
-```bash
-python baseline_collector.py --rebuild
+## The protocol
+
+### Blocks
+
+A session is a series of blocks. Each block is preceded by a short gap.
+
+| Session type | Labels | Default |
+|---|---|---|
+| Intention | AIM HIGH, AIM LOW, REST | 8 of each = 24 blocks x 30 s, ~13 min |
+| Connection | CONNECT, REST | 12 of each = 24 blocks x 30 s, ~13 min |
+
+Every label appears the same number of times. The order is shuffled with Python's `secrets` module, which uses the operating system's cryptographic random source. It is never drawn from the generators under test. The gap before each block shows the next cue, so the person can get ready, and no data from the gap is analyzed.
+
+### What is fixed before the session starts
+
+When a session starts, files are written in this order:
+
+1. `meta.json` records the full protocol configuration and a **config hash**, before the recorder starts. The configuration includes the session type, real or sham, block length and count, bits per read, the statistic, the tail, the permutation settings and the analysis version.
+2. `schedule.csv` records every block's label and its start and end times on the monotonic clock. It is written and fsynced before the first block begins.
+3. `reads.bin` is the raw data. It is appended continuously by the recorder.
+
+The analysis assigns each read to a block by comparing the read's timestamps with the schedule. A read counts only if it falls entirely inside a block, and only blocks that ran to completion are used.
+
+### Sham sessions
+
+A sham session runs the same kind of schedule with the same files and the same analysis, but shows no cues and gives no feedback. Run sham sessions unattended, interleaved with real ones (for example a sham after every real session, or overnight). Their combined result is the control: it shows what the full pipeline produces when nobody is trying.
+
+---
+
+## What each number means
+
+### The pre-specified statistic (one per session type)
+
+**Intention:** `p1(HIGH) - p1(LOW)`. This is the proportion of 1 bits in all AIM HIGH blocks minus the proportion in all AIM LOW blocks, with both generators pooled.
+
+- Both generators lean slightly toward 0. They sit near p(1) = 0.4992, not 0.5. Because the statistic is a difference between two conditions that share the same lean, the lean cancels out. Nothing assumes 0.5.
+- The test is **one-sided**: the prediction is HIGH > LOW.
+
+**Connection:** `mean z1*z2 in CONNECT - mean z1*z2 in REST`.
+
+- For each read, each generator's proportion of 1s is converted to a z score using the mean and standard deviation from the session's own REST blocks. So the lean and the actual spread of the hardware come from the data, not from theory.
+- `z1*z2` is positive when the two generators deviate in the same direction at the same moment. Its mean in CONNECT minus its mean in REST measures extra coupling during CONNECT.
+- The test is **two-sided**, because coherence could show up as positive or negative coupling.
+- **Secondary:** NetVar, computed the same way. Per read, Stouffer Z = (z1 + z2)/√2 and NetVar = Z². The secondary statistic is mean NetVar in CONNECT minus REST, tested **one-sided** (higher in CONNECT), following the Global Consciousness Project convention. It is reported alongside the primary but is not the primary.
+
+### The p-value: a permutation test over block labels
+
+Because the labels were assigned to blocks at random, the null hypothesis ("labels make no difference") says any other assignment of the same labels to the same blocks was equally likely. The test computes the statistic for every reassignment, or 20,000 random ones when there are too many to enumerate. **p** is the fraction of reassignments that give a statistic at least as extreme as the one observed.
+
+- This assumes nothing about bias, drift or the shape of the noise in the hardware. The only assumption is that the labels were randomized, which the protocol guarantees.
+- For connection sessions, the REST-based z scaling is recalculated for each reassignment.
+
+**The resolution is set by the number of blocks.** With 8 HIGH and 8 LOW blocks there are 12,870 ways to assign the labels, so the smallest possible p is 1/12,870, and a single session's z cannot exceed about 3.8, however strong an effect is. Connection sessions use 20,000 random reassignments, which gives a similar ceiling of about 3.9. Collecting more bits per block makes a session more sensitive to small effects. Adding blocks raises that ceiling.
+
+### Session results (`results.json`, one ledger row)
+
+| Field | Meaning |
+|---|---|
+| `statistic` | The pre-specified statistic above |
+| `p` | Permutation p-value, using the pre-specified tail |
+| `z` | The same result on a normal scale. Converting it back with the same tail gives exactly `p`. It is positive when the statistic is high. Sessions are combined with this z. |
+| `z_parametric` | A textbook normal approximation, for reference only. It can be much larger than `z` when the effect is large, because the permutation z has the ceiling described above. |
+| `lean_p1`, `lean_p2` | p(1) of each generator, estimated from REST blocks |
+| `secondary_*` | Connection only: the NetVar statistic, z and p |
+| `blocks_used` | Blocks that completed and contained data |
+| `bits_collected` / `bits_analyzed` | All bits recorded, and the bits inside analyzed blocks |
+| `status` | `complete`, `stopped` (ended early), `interrupted` (the program died), `recorder_failed`; suffixed `-no-result` if too few blocks completed for a test |
+| `config_hash` | Identifies the exact protocol and analysis version |
+
+### Live feedback (display only)
+
+The GUI shows the session's own measure on the current block:
+
+- **Intention:** the z of the block's proportion of 1s, compared with the lean estimated from REST blocks so far. It is signed by the aim, so positive always means "the way you are aiming".
+- **Connection:** the sum of `z1*z2` over the block divided by √(reads in the block).
+
+Live feedback is not the result. The confirmatory p comes from the permutation test after the session.
+
+### The report: combining sessions
+
+`python app.py report` combines the ledger rows with Stouffer's method, Z = Σz/√k. It does this **separately for each session type and for real and sham sessions**, and uses each type's tail. It also shows the difference in mean z between real and sham sessions.
+
+How to read it:
+
+- **Sham Z** should look like chance (|Z| under 2 most of the time). If it doesn't, something in the hardware or pipeline is producing effects on its own, and real-session results can't be trusted until that's found.
+- **Real Z** is the confirmatory result.
+- **Real vs sham** tests whether real sessions differ from controls run through the same pipeline.
+
+Every session that starts is recorded, including sessions that were stopped early or interrupted. Otherwise, stopping when things look bad would quietly bias the totals. `--complete-only` shows the totals without them. Decide in advance how many sessions you will run, so the stopping point for the series is fixed too.
+
+### Exploratory scan (never in the ledger)
+
+`exploratory.json` and the lower panel of `session.png` show a multi-scale scan. Its statistic is the largest standardized windowed sum of the session's measure over all window lengths (5–160 s) and all positions, using full windows only. Its null distribution comes from circular time shifts:
+
+- **Connection:** generator 2 is shifted against generator 1.
+- **Intention:** the aim sequence is shifted against the data.
+
+This keeps each stream's own bias, drift and autocorrelation and breaks only their alignment. `p_scan` answers: "is there a stretch somewhere in this session that is more unusual than chance would give, at any time scale?" Use it to generate hypotheses for future pre-specified tests, not as evidence.
+
+---
+
+## Files
+
+```
+sessions/
+  ledger.csv                 one row per session (confirmatory only)
+  <YYYYmmdd_HHMMSS>_<type>[_sham]/
+    meta.json                frozen config, hash, status, timing
+    schedule.csv             block labels and times, written before the first block
+    reads.bin                raw recording (not committed to git by default; can be large)
+    acq_log.csv              recorder start/stop, resyncs, errors
+    results.json             confirmatory result
+    exploratory.json         scan result (EXPLORATORY)
+    session.png              per-block chart + exploratory trace
 ```
 
-## Choosing a Duration
+`reads.bin` starts with a 16-byte header. Each read then adds one fixed-size record per generator: the monotonic start and end time, a sequence number shared by the two generators of a read, the generator number, n, the count of ones, and the n LSBs packed into bytes.
 
-| Duration | Pros | Cons |
-|----------|------|------|
-| **5 min** | Quick iteration; exercises all 5 multi-scale windows (20s through 5min) | Few data points; rolling averages may not stabilize; wide confidence intervals |
-| **15 min** (default) | Good balance of statistical power and practicality; rolling correlation MA converges; enough samples for meaningful FDR correction | May miss very slow coherence patterns |
-| **30 min** | Strong statistical power; Bayes factors become more decisive; multi-scale analysis has deep history at every window size | Requires sustained focus if doing intention-based work |
-| **60+ min** | Maximum sensitivity; tightest confidence intervals; robust bootstrap p-values against baseline | Diminishing returns per additional minute; large CSV files; fatigue effects |
+Code layout: `dualrng/recorder.py` (acquisition), `sources.py` (hardware and simulator), `records.py` (file format), `protocol.py` (configuration and schedule), `stats.py` (statistics and permutation tests), `analysis.py` (finalization), `ledger.py` (ledger and report), `scan.py` (exploratory scan), `live.py` (live feedback), `session.py` (session runner), `probe.py` (device check), and `sine_gui.py` / `app.py` (UI and command line).
 
-**Minimum viable trial**: 5 minutes (all multi-scale windows need at least 60 five-second bins).
-**Recommended starting point**: 15 minutes.
+### Acquisition design
 
-### How duration affects the statistics
+The recorder is a separate process. It reads the device continuously, with no sleeps and no mode switching, and appends every read to `reads.bin`. Each write is flushed immediately and fsynced every second. The GUI, live feedback and analysis only read that file, so none of them can stall acquisition. If the main program dies, the recorder notices within a second, releases the serial port and exits.
 
-- **Rolling correlation** uses a 10-bin window (~50 seconds). Short trials have few independent windows, so individual spikes carry disproportionate weight.
-- **Stouffer's global Z** scales as the square root of the number of samples. Doubling duration increases sensitivity by ~1.4x.
-- **Multi-scale FDR correction** tests every timepoint at every scale. Longer trials produce more tests, raising the bar each individual event must clear—but also giving real effects more chances to appear.
-- **Bayes Factor (BF10)** includes a log(n) penalty, so weak effects that look promising in short trials may become inconclusive in longer ones. Only genuine effects survive.
+---
 
-## Reading the NetVar (NPS) Output
+## Hardware
 
-NetVar (network variance) measures how far the combined RNG output deviates from expected randomness at each moment, following the approach used by the Global Consciousness Project [1]. It is derived from Stouffer's Z [2] (the combined Z-score of both RNG streams): `NetVar = Stouffer_Z²`. This raw chi-square value is then scaled to a 1–324 display range.
+### What the documentation says, and what this code relies on
 
-### NetVar chart (`plot_netvar_*.png`)
+- **Mode selection** works by a baud-rate "knock": open the port at 110, 300 and 110 baud, then at the mode's baud rate. This is documented by ubld.it.
+- **MODE_RAW_BIN (19200)** is the mode used here. Its documented format is 4-byte packets. Bits 7:6 of every byte are a sequence code: generator 1 high byte, generator 1 low byte, generator 2 high byte, generator 2 low byte. Together the bytes hold one 10-bit ADC sample from each generator. Pairing by packet is therefore guaranteed by the format. The parser checks every tag, resynchronizes on any misalignment, and logs the count in `acq_log.csv`. The bit analyzed is the LSB of each 10-bit sample, the same bit the earlier version used.
 
-The top panel shows Z1, Z2, and Stouffer's Z over time. The bottom panel shows scaled NetVar with colored horizontal bands marking category thresholds.
+### Where the documentation was unclear, and the calls I made
 
-| NetVar Range | Label | Meaning |
-|-------------|-------|---------|
-| 1–139 | Normal | Baseline randomness |
-| 140–165 | Elevated | Slightly unusual |
-| 166–218 | High | Notable deviation |
-| 219–278 | Very High | Strong effect |
-| 279–324 | Extreme | Rare deviation |
+1. **MODE_UNWHITENED (57600) is not documented.** It appears only in the vendor's example scripts, as "Unwhitened RNG1-RNG2 (TrueRNGproV2 Only)". That doesn't say whether the stream interleaves the two generators or carries their difference, nor whether it is ASCII or binary. The earlier code parsed it as ASCII and split it by alternating values, but that behaviour couldn't be verified. **Decision:** use the documented MODE_RAW_BIN instead.
+2. **The command bytes 0xB0 (reset), 0xC4 and 0xC5 (select generator 1 or 2)** that the earlier code sent are not in any vendor document I found. The vendor page says modes are selected by baud rate precisely so the device does not have to listen for commands. **Decision:** don't send them.
+3. **Simultaneity.** The RAW_BIN documentation shows one sample from each generator per packet, but it does not state that the two samples are taken at the same instant. Within a packet they are at least adjacent, far closer than the old sequential reads 0.2 s or more apart.
+4. **LSB bias.** Vendor staff say the ADC LSB carries manufacturing-dependent bias. This fits the p(1) ≈ 0.4992 seen in every session. **Decision:** keep the LSB, for continuity with the existing data, and handle the bias through the protocol: lean estimated from REST blocks, statistics that cancel it, and permutation p-values. If you prefer, the full 10-bit samples are available in the parser for a different bit choice later.
+5. **Read timestamps.** Each read is timestamped when its bytes arrive. USB and driver buffering mean the bits were generated slightly earlier, by an unknown but small amount when reading continuously. The 3 s gap before each block absorbs this.
+6. **RAW_ASC sample text and the TrueRNG V1/V2 differences** are inconsistent on the vendor pages. They aren't used here.
 
-### Multi-scale NetVar charts
+**Please run `python app.py probe` once on the Pi.** It captures a sample in MODE_UNWHITENED and in MODE_RAW_BIN, saves the raw bytes under `probe/`, and prints what it finds. For MODE_UNWHITENED it reports whether the data is ASCII, any '-' signs, and the even/odd value statistics. For MODE_RAW_BIN it reports tag alignment, the packet rate, each generator's mean and SD (the vendor expects a mean of 400–600 and an SD of 30–100), the LSB bias, and the correlation between the generators. That settles the questions above for your unit.
 
-- **`plot_multiscale_nv_*.png`** — Rolling mean of raw NetVar (Z²) at multiple window sizes (8s, 20s, 30s, 1min, 3min, 5min). Under the null hypothesis the mean should hover around 1.0. Points that deviate significantly after FDR correction are highlighted.
-- **`plot_multiscale_nv_scaled_*.png`** — The same multi-scale view but using the scaled 1–324 range with category threshold lines overlaid.
+### Other judgment calls
 
-### What to look for in NetVar
+- The tails are fixed in code: intention is one-sided (HIGH > LOW), connection is two-sided, and NetVar is one-sided (higher in CONNECT).
+- Stopped and interrupted sessions are included in the ledger and the report by default, flagged, with `--complete-only` as the alternative.
+- The connection z scaling uses the empirical mean and SD of REST reads, not the binomial SD, so any excess hardware variance is handled.
+- The old baseline collection is replaced by sham sessions. Sham sessions are the control for everything in the pipeline, not just the generators.
 
-- **Normal trial**: values mostly in the 1–139 range, occasional spikes into Elevated.
-- **Unusual trial**: sustained periods in the High range or repeated spikes into Very High/Extreme. The multi-scale chart will show the rolling mean lifting above 1.0 at one or more timescales.
+---
 
-## Reading the Correlation Output
+## Validation
 
-Correlation measures whether the two RNG streams are moving together (positive) or apart (negative) over time, computed as a 10-bin rolling Pearson correlation [3] between binned Z1 and Z2 (~50-second window, updated every ~5 seconds).
+`pytest` runs the following, using the simulated source (no hardware needed):
 
-### Correlation chart (`plot_corr_*.png`)
+- **Null calibration:** 400 simulated sessions of each type give uniform p-values (KS test, and a rejection rate at 0.05 within binomial limits). This holds both with p(1) = 0.5 and with the hardware's lean (0.4992 / 0.4994). The NetVar secondary is checked too.
+- **Power:** with an injected intention effect of 2.5 standard errors (HIGH +δ, LOW −δ) and with an injected shared signal (correlation 0.06 in CONNECT blocks), the detection rate over 300 sessions matches the power expected for that effect size within ±0.09.
+- **Exact enumeration and Monte Carlo agree**, the ledger z round-trips to the session p, and stopped sessions use only completed blocks.
+- **The exploratory scan** is calibrated under the null (rejection rate within binomial limits) and locates an injected local burst.
+- **Acquisition:** RAW_BIN parsing, including chunking, garbage bytes and a dropped byte. Also the file format, including a truncated last record, and the recorder process.
+- **End to end:** a headless session; the real GUI loop driven by taps (the Stop button, and closing the window mid-session) produces a finalized session and a ledger row; a session killed with SIGKILL is recovered on the next start.
 
-Shows the rolling correlation (blue) with a 20-bin moving average trendline (red dashed). Significant points (p < 0.05, effect size > 0.5) are marked in red. If baseline data is available, a blue shaded band shows the 95% confidence interval from null sessions. Dashed green/brown lines at +/-0.6 mark the high-correlation thresholds. A summary bar at the bottom shows trial outcome, BF10, significant scales, and bootstrap p-value.
+The simulator draws bits with `p(1) = lean ± δ` for intention effects. It adds a shared random shift to both generators' p(1) to give a stated correlation `rho` between their per-read z scores. Use `--sim-delta` and `--sim-rho` to see what an effect of a given size looks like in the GUI and report.
 
-| |r| | Label |
-|-----|-------|
-| < 0.1 | Negligible |
-| 0.1–0.3 | Mild |
-| 0.3–0.5 | Moderate |
-| 0.5–0.7 | Strong |
-| 0.7–0.9 | Very Strong |
-| > 0.9 | Near Perfect |
+---
 
-### Multi-scale correlation chart (`plot_multiscale_*.png`)
+## The pre-2.0 data in `data/`
 
-One subplot per timescale (8s, 20s, 30s, 1min, 3min, 5min). Each shows rolling correlation at that window size. Points that survive Benjamini-Hochberg [4] FDR correction are marked in red. Longer timescales smooth out noise and reveal sustained coherence patterns; shorter timescales catch brief spikes.
+The earlier version had problems that the review of the code and the February 2026 data found:
 
-### What to look for in correlation
+- Its z scores assumed p(1) = 0.5.
+- About two thirds of each session's wall time was not sampled, because collection stalled while charts were redrawn.
+- The two generators were read one after the other, not as pairs.
+- Its multi-scale analysis tested half-full windows as if full, and its 8-second scale correlated only 2–4 points.
+- Its Global Z treated overlapping windows as independent.
+- Its event CSVs were re-written on every refresh. The 13 `multiscale_events_*.csv` files hold 13,593 rows, but only 353 unique (time, scale) events. 176 of those are at the 5-minute scale, mostly from half-full windows early in a session.
 
-- **Normal trial**: rolling correlation fluctuates around 0, moving average stays flat, few or no red markers.
-- **Unusual trial**: sustained runs above 0.3 (or below -0.3), moving average trends away from zero, FDR-corrected events cluster at one or more timescales.
+Re-running those sessions through the new exploratory connection scan (`python app.py scan --legacy data`, saved in `reports/legacy_exploratory_scan.txt`):
 
-## Terminal Output Reference
+- **None of the 17 sessions has p_scan < 0.05.** The smallest is 0.061, and about 0.9 would be expected below 0.05 by chance.
+- Generator leans are 0.4990–0.4995 in every session.
+- The correlation between z1 and z2 per read ranges from −0.058 to +0.065.
+- The no-stall fraction of wall time is about 40%.
 
-At each refresh (~6 seconds) the console prints rolling correlation stats. A trial summary block prints each cycle with cumulative statistics:
+This is exploratory. The legacy sessions had no randomized protocol, so they can't be analyzed with the confirmatory statistics.
 
-```
-Trial Summary (15 min)
-   Global Z: 0.333, p: 0.7392 (theoretical), p: 0.4098 (bootstrap)
-   Bayes Factor (BF10): 0.07
-   Mean correlation: 0.0395 [-0.0924, 0.1700]
-   Significant scales: 8s (1 events, min p=0.0000)
-   Strongest event: 2026-02-11 00:07:46 at 8s scale (r=-0.9999, p=0.000001)
-   Events: 1 survived FDR correction
-   15 minute trial complete.
-```
-
-### Line-by-line breakdown
-
-**`Global Z: 0.333`** — The trial-level test statistic. All rolling correlation values are Fisher-Z transformed [5] and combined via Stouffer's method [2]: `Z_global = sum(z_i) / sqrt(n)`. A single number summarizing the entire trial. Values near 0 mean no overall effect; values beyond +/-2 are unusual.
-
-**`p: 0.7392 (theoretical)`** — The two-tailed p-value derived from the standard normal distribution. It answers: "If there were truly no coherence, how often would we see a Global Z this large or larger by chance?" Here, 0.74 means ~74% of the time — completely unremarkable.
-
-**`p: 0.4098 (bootstrap)`** — A second, more conservative p-value computed by block bootstrap [6] from your baseline data. The procedure: sample 10,000 synthetic trials (contiguous blocks of baseline correlations, preserving autocorrelation), compute a Z_global for each, and count how many are as extreme as the observed value. This accounts for the actual statistical properties of your specific hardware rather than assuming textbook normality. Only appears if baseline data has been collected.
-
-**`Bayes Factor (BF10): 0.07`** — The evidence ratio: how much more likely is the data under "coherence exists" (H1) versus "no coherence" (H0). Computed via BIC approximation [7]: `BF10 = exp((Z² - log(n)) / 2)`. Interpretation thresholds follow Jeffreys' scale as updated by Lee & Wagenmakers [8].
-
-| BF10 | Interpretation |
-|------|---------------|
-| < 0.33 | Moderate evidence for H0 (no coherence) |
-| 0.33–3 | Inconclusive |
-| 3–10 | Moderate evidence for H1 (coherence) |
-| 10–100 | Strong evidence for H1 |
-| > 100 | Very strong evidence for H1 |
-
-A BF10 of 0.07 means the data is ~14x more likely under no-coherence than under coherence.
-
-**`Mean correlation: 0.0395 [-0.0924, 0.1700]`** — The average rolling correlation across all time bins, with a 95% confidence interval computed via Fisher-Z transform [5]. If the interval contains 0, the mean correlation is not distinguishable from chance.
-
-**`Significant scales: 8s (1 events, min p=0.0000)`** — Which timescales produced events that survived Benjamini-Hochberg FDR correction [4] (see below), how many events at each scale, and the smallest adjusted p-value. "none" means no timescale had any surviving events.
-
-**`Strongest event: 2026-02-11 00:07:46 at 8s scale (r=-0.9999, p=0.000001)`** — The single most statistically significant correlation event across all timescales. Shows the timestamp, which scale detected it, the correlation value, and the FDR-adjusted p-value.
-
-**`Events: 1 survived FDR correction`** — Total count of events across all timescales that passed the Benjamini-Hochberg threshold. This is the bottom line for multi-scale analysis: how many moments of apparent coherence held up after correcting for multiple comparisons.
-
-**`15 minute trial complete.`** — Trial outcome. Three possible messages:
-- *"Statistically significant N minute trial"* — p_global < 0.05
-- *"N minute trial approached significance"* — p_global between 0.05 and 0.10
-- *"N minute trial complete"* — p_global >= 0.10 (no significant effect detected)
-
-### Benjamini-Hochberg FDR correction
-
-When testing hundreds of timepoints across multiple scales, some will appear significant by chance alone. If you test 300 points at p < 0.05, you expect ~15 false positives even with perfectly random data. The Benjamini-Hochberg (BH) procedure [4] controls the **false discovery rate** — the expected proportion of reported discoveries that are actually false. It works by ranking all p-values from smallest to largest and comparing each to a threshold that depends on its rank: `p_k <= (k/m) * alpha`, where `k` is the rank, `m` is the total number of tests, and `alpha` is the target FDR (0.05). Events that survive this correction are unlikely to be noise. Unlike the more conservative Bonferroni correction (which controls the chance of *any* false positive), BH allows more true discoveries through while still keeping the false discovery proportion under control.
-
-## Output Files
-
-All files are timestamped with the trial start time.
-
-**`data/` directory:**
-- `session_*.csv` — Raw per-sample data (timestamps, z1, z2, stouffers_z, nvar, svar)
-- `correlation_*.csv` — Binned rolling correlations and moving averages
-- `significant_events_*.csv` — Events where p < 0.05 and effect size > 0.5
-- `multiscale_events_*.csv` — FDR-corrected events with scale, correlation, and adjusted p-value
-
-**`charts/` directory:**
-- `plot_netvar_*.png` — Z-scores over time (top) and NetVar with color thresholds (bottom)
-- `plot_multiscale_nv_*.png` — Multi-scale NetVar with FDR-significant deviations marked
-- `plot_multiscale_nv_scaled_*.png` — Multi-scale NetVar in scaled 1–324 range
-- `plot_corr_*.png` — Rolling correlation with significant events, baseline CI, and summary stats
-- `plot_multiscale_*.png` — Correlation at each timescale with FDR-significant points highlighted
-
-## Examples
-
-### What a normal trial looks like
-
-- Global Z near 0, p around 0.5
-- BF10 below 0.33 or near 1
-- Bootstrap p-value well above 0.05
-- Rolling correlation fluctuates around 0
-- Few or no events survive FDR correction
-- Summary: "[N] minute trial complete"
-
-### What a significant trial looks like
-
-- Global Z above 2 (or below -2), p below 0.05
-- BF10 above 3
-- Bootstrap p-value below 0.05, roughly agreeing with theoretical p
-- Sustained periods of |r| > 0.3
-- Multiple FDR-corrected events, often clustered at the 1–3 minute scales
-- Summary: "Statistically significant [N] minute trial"
+---
 
 ## References
 
-[1] Nelson, R. D. et al. (2002). "Correlations of continuous random data with major world events." *Foundations of Physics Letters*, 15(6), 537–550. See also the [Global Consciousness Project](https://noosphere.princeton.edu/).
-
-[2] Stouffer, S. A. et al. (1949). *The American Soldier: Adjustment During Army Life*. Princeton University Press. (Stouffer's Z method for combining independent significance tests.)
-
-[3] Pearson, K. (1895). "Note on regression and inheritance in the case of two parents." *Proceedings of the Royal Society of London*, 58, 240–242.
-
-[4] Benjamini, Y. & Hochberg, Y. (1995). "Controlling the false discovery rate: a practical and powerful approach to multiple testing." *Journal of the Royal Statistical Society, Series B*, 57(1), 289–300.
-
-[5] Fisher, R. A. (1921). "On the 'probable error' of a coefficient of correlation deduced from a small sample." *Metron*, 1, 3–32. (Fisher Z transform for correlation inference.)
-
-[6] Künsch, H. R. (1989). "The jackknife and the bootstrap for general stationary observations." *Annals of Statistics*, 17(3), 1217–1241. (Block bootstrap for dependent data.)
-
-[7] Wagenmakers, E.-J. (2007). "A practical solution to the pervasive problems of p values." *Psychonomic Bulletin & Review*, 14(5), 779–804. (BIC approximation to Bayes factors.)
-
-[8] Lee, M. D. & Wagenmakers, E.-J. (2013). *Bayesian Cognitive Modeling: A Practical Course*. Cambridge University Press. (Bayes factor interpretation thresholds.)
+- Stouffer, S. A. et al. (1949). *The American Soldier*. Princeton University Press. (Stouffer's method for combining z scores.)
+- Nelson, R. D. et al. (2002). Correlations of continuous random data with major world events. *Foundations of Physics Letters*, 15(6), 537–550. (NetVar as used by the Global Consciousness Project.)
+- Good, P. (2005). *Permutation, Parametric, and Bootstrap Tests of Hypotheses*. Springer. (Permutation tests based on randomization.)
+- Kulldorff, M. (1997). A spatial scan statistic. *Communications in Statistics – Theory and Methods*, 26(6), 1481–1496. (Scan statistics, max over windows.)
+- ubld.it: [How to change TrueRNGpro's mode](https://ubld.it/products/about/how-to-change-truerngpros-mode), [TrueRNGpro raw binary format](https://ubld.it/products/support/truerngpro-raw-binary-format); vendor example scripts at [github.com/euler357/TrueRNG](https://github.com/euler357/TrueRNG).

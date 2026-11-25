@@ -1,1 +1,6 @@
 __pycache__/
+.DS_Store
+# Raw recordings can be tens of MB per session; results, schedule, meta and
+# the ledger are small and can be committed.
+sessions/*/reads.bin
+probe/
