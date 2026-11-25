@@ -4,7 +4,9 @@ Reads only; the recorder never waits on it. The value shown is the session's
 pre-specified measure computed on the current block:
 
 * intention:  aim-signed z of the block's pooled p(1) against the lean
-  estimated from REST blocks so far (all reads so far before any REST block).
+  estimated from REST blocks so far (before any REST data: all other reads so
+  far, never the block being shown). block_trace() gives the same measure
+  read by read, as a cumulative deviation for the trace display.
 * connection: sum of z1*z2 over the block / sqrt(reads), with z standardized
   from REST blocks so far (all reads so far before enough REST data).
 
@@ -35,6 +37,7 @@ class LiveFeedback:
         self.blk = {f: np.zeros(nb) for f in FIELDS}
         self.all = {f: 0.0 for f in FIELDS}
         self._pending = {}
+        self._block_reads = {}   # block index -> list of (pooled ones, pooled bits)
         self.last_read_mono = None
         self.reads = 0
 
@@ -65,20 +68,44 @@ class LiveFeedback:
         if 0 <= i < len(self.plan) and t1 <= self.ends[i]:
             for f, v in vals.items():
                 self.blk[f][i] += v
+            self._block_reads.setdefault(i, []).append((o1 + o2, 2 * n))
         self.last_read_mono = t1
         self.reads += 1
 
-    def _rest(self) -> dict:
+    def _rest(self, exclude: int | None = None) -> dict:
         m = np.array([lab == "REST" for lab in self.labels])
         rest = {f: float(self.blk[f][m].sum()) for f in FIELDS}
-        return rest if rest["count"] >= 10 else self.all
+        if rest["count"] >= 10:
+            return rest
+        # No REST data yet: everything recorded so far except the block being shown.
+        if exclude is None:
+            return dict(self.all)
+        return {f: self.all[f] - float(self.blk[f][exclude]) for f in FIELDS}
+
+    def pooled_lean(self, exclude: int | None = None) -> float | None:
+        base = self._rest(exclude)
+        if base["bits"] <= 0:
+            return None
+        return (base["O1"] + base["O2"]) / (2 * base["bits"])
+
+    def block_trace(self, index: int) -> np.ndarray | None:
+        """Cumulative deviation of the block, read by read, in z units:
+        trace[k] = sum over the first k+1 reads of (ones - bits*p0) / sqrt(bits*p0*q0),
+        with p0 the pooled lean from REST blocks. Up means more 1s than usual.
+        Under chance, trace[k] has standard deviation sqrt(k+1)."""
+        reads = self._block_reads.get(index)
+        p0 = self.pooled_lean(exclude=index)
+        if not reads or p0 is None or not 0 < p0 < 1:
+            return None
+        r = np.asarray(reads, dtype=float)
+        return np.cumsum((r[:, 0] - r[:, 1] * p0) / np.sqrt(r[:, 1] * p0 * (1 - p0)))
 
     def block_z(self, index: int) -> float | None:
         """The pre-specified measure on one block, as a z-like number (aim-signed for intention)."""
         b = {f: float(self.blk[f][index]) for f in FIELDS}
         if b["count"] < 2:
             return None
-        base = self._rest()
+        base = self._rest(exclude=index)
         if base["count"] < 2:
             return None
         if self.session_type == "intention":

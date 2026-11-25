@@ -116,6 +116,8 @@ def ledger_row(session_id: str, meta: dict, config: ProtocolConfig, result: dict
         "session_type": config.session_type,
         "condition": "sham" if config.sham else "real",
         "status": status if p else f"{status}-no-result",
+        # Sham sessions show no feedback (the configured display stays in meta.json).
+        "feedback": "none" if config.sham else config.feedback,
         "statistic_name": config.primary_statistic,
         "statistic": p.get("statistic"),
         "z": p.get("z"),

@@ -38,11 +38,12 @@ def ledger_path(args) -> str:
     return os.path.join(args.base_dir, "ledger.csv")
 
 
-def build_config(args, session_type: str, sham: bool) -> ProtocolConfig:
+def build_config(args, session_type: str, sham: bool, feedback: str = "") -> ProtocolConfig:
     return ProtocolConfig(
         session_type=session_type, sham=sham,
         block_seconds=args.block_seconds, gap_seconds=args.gap_seconds,
         blocks_per_label=args.blocks_per_label or 0, bits_per_read=args.bits_per_read,
+        feedback=feedback,
     )
 
 
@@ -92,19 +93,22 @@ class Controller:
         self.worker = None
         self._last_poll = 0.0
         self._last_index = None
-        self.selection_changed(gui.session_type, gui.sham)
+        if getattr(args, "feedback", None):
+            gui.feedback = args.feedback
+        self.selection_changed(gui.session_type, gui.sham, gui.chosen_feedback())
 
-    def selection_changed(self, session_type, sham):
-        cfg = build_config(self.args, session_type, sham)
+    def selection_changed(self, session_type, sham, feedback=""):
+        cfg = build_config(self.args, session_type, sham, feedback)
         self.gui.plan_text = (f"{cfg.n_blocks} blocks x {cfg.block_seconds:g} s  "
                               f"({' / '.join(cfg.labels)})  ~{cfg.duration_seconds / 60:.0f} min"
                               + ("  no cues" if sham else ""))
 
-    def start(self, session_type, sham):
+    def start(self, session_type, sham, feedback=""):
         if self.worker and self.worker.is_alive():
             return
         self.gui.mode = "starting"
-        cfg = build_config(self.args, session_type, sham)
+        cfg = build_config(self.args, session_type, sham, feedback)
+        self.gui.display = "wave" if sham else cfg.feedback
 
         def job():
             runner = SessionRunner(cfg, self.args.base_dir, source_spec(self.args), ledger_path(self.args))
@@ -153,17 +157,22 @@ class Controller:
         if st["phase"] == "gap" and self._last_index is not None:
             self._close_block()
         g.progress = f"Block {idx + 1}/{n}"
+        g.trace, g.aim = None, 0
         if sham:
-            g.cue, g.cue_dim, g.feedback, g.coherence = "CONTROL", True, "", 0.0
+            g.cue, g.cue_dim, g.feedback_text, g.coherence = "CONTROL", True, "", 0.0
         elif st["phase"] == "gap":
-            g.cue, g.cue_dim, g.feedback, g.coherence = f"Next: {st['cue']}", True, "", 0.0
+            g.cue, g.cue_dim, g.feedback_text, g.coherence = f"Next: {st['cue']}", True, "", 0.0
         else:
             self._last_index = idx
             g.cue, g.cue_dim = st["cue"], False
             v = self._block_value(idx)
             raw = self.live.block_z(idx)
-            g.feedback = "" if raw is None else f"z {raw:+.2f}"
+            g.feedback_text = "" if raw is None else f"z {raw:+.2f}"
             g.coherence = 0.0 if v is None else max(0.0, min(1.0, v / 2.5))
+            aim = {"HIGH": 1, "LOW": -1}.get(st["label"], 0)
+            if g.display == "trace" and aim:
+                g.trace, g.aim = self.live.block_trace(idx), aim
+                g.block_frac = st["elapsed"] / r.config.block_seconds
         if not r.recorder_ok():
             g.status = "Recorder stopped - see acq_log.csv"
         elif self.live.last_read_mono is not None and now - self.live.last_read_mono > 3:
@@ -246,7 +255,7 @@ def cmd_gui(args):
 def cmd_run(args):
     for d, res in finalize_pending(args.base_dir, ledger_path(args)):
         print(f"Finalized earlier session {os.path.basename(d)}: {summarize(res)}")
-    cfg = build_config(args, args.type, args.sham)
+    cfg = build_config(args, args.type, args.sham, "text")
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda s, f: stop.set())
     signal.signal(signal.SIGTERM, lambda s, f: stop.set())
@@ -369,6 +378,8 @@ def main(argv=None):
     p = sub.add_parser("gui", help="fullscreen GUI")
     add_session_args(p)
     p.add_argument("--windowed", action="store_true")
+    p.add_argument("--feedback", choices=("trace", "wave"),
+                   help="initial display for intention sessions (default trace; changeable on screen)")
     p.set_defaults(func=cmd_gui)
 
     p = sub.add_parser("run", help="headless session")

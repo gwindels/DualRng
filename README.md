@@ -28,7 +28,7 @@ python app.py --gui --block-seconds 20 --blocks-per-label 10
 python app.py --gui --source sim            # no hardware needed
 ```
 
-On the idle screen, choose **Intention** or **Connection** and turn **Sham** on or off, then tap **Start Session**. The line under the buttons shows the block plan and the total duration. The summary at the top shows the result of the last session.
+On the idle screen, choose **Intention** or **Connection** and turn **Sham** on or off. For intention, also pick the **Display**: `trace` (the default) or `wave`. Then tap **Start Session**. The line under the buttons shows the block plan and the total duration. The summary at the top shows the result of the last session.
 
 During a session:
 
@@ -36,12 +36,28 @@ During a session:
 |---|---|
 | Top left | The cue for the current block: **AIM HIGH**, **AIM LOW**, **CONNECT** or **REST**. Between blocks it shows the next cue, dimmed. |
 | Top right | Block progress (`Block 5/24`) |
-| Wave | Live feedback. It grows calmer and brighter as the current block's measure moves the intended way (see "Live feedback"). |
+| Middle | Live feedback: the **trace** or the **wave** (see "Displays" below) |
 | Bottom right | The current block's z (see "Live feedback") |
 | Bottom center | Circles for completed blocks that went the intended way (z > 1). The colour shows how strongly: purple > 1, orange > 1.645, yellow > 2.33, pink > 3.09. |
 | Bottom left | **Stop**. Tap it twice within 3 seconds to end the session early. |
 
 A sham session shows **CONTROL**, the block progress, and a dimmed wave that does not respond. It shows no cues and no feedback.
+
+#### Displays
+
+**Trace (intention, default).** During each AIM HIGH or AIM LOW block, a line starts at the left edge as the block begins and reaches the right edge as it ends.
+
+- **What the line shows:** it is the block's *cumulative deviation*. Each read moves it up if that read had more 1s than the generators' usual lean (estimated from REST blocks), and down if fewer. Up always means more 1s.
+- **The arrow** on the right shows the aim: up for AIM HIGH, down for AIM LOW.
+- **The gray curves** show where chance alone keeps the line 95% of the time (±1.96 √reads). A line that runs outside them in the aimed direction is doing something chance rarely does.
+- **Colours** follow the same palette as the wave. The line goes from amber through yellow and green to pale gold as the block moves further the aimed way.
+- **Between blocks and in REST blocks,** only the centre line shows.
+
+This is the classic display for RNG intention work, the same idea as the Global Consciousness Project's cumulative deviation graphs.
+
+**Wave (connection, and optional for intention).** This is the original sine-wave visual. It grows calmer and brighter as the current block's measure moves the intended way. It suits group and connection sessions, where the goal is coherence rather than a direction.
+
+The display is part of the protocol. It is saved in `meta.json` and the ledger (`feedback` column: `trace`, `wave`, `text` for headless runs, `none` for sham), and it changes the config hash. The report shows results by display whenever more than one display has been used, so sessions run differently are never pooled unknowingly.
 
 Double-tap the screen to leave fullscreen, and press Escape to quit. **However the session ends** (it finishes, you tap Stop, you quit, the window closes, or the app gets Ctrl-C or SIGTERM), the session is stopped, analyzed and added to the ledger. If the program is killed or the Pi loses power, the data recorded up to that point is already on disk. That session is analyzed the next time the app starts.
 
@@ -137,13 +153,14 @@ Because the labels were assigned to blocks at random, the null hypothesis ("labe
 | `blocks_used` | Blocks that completed and contained data |
 | `bits_collected` / `bits_analyzed` | All bits recorded, and the bits inside analyzed blocks |
 | `status` | `complete`, `stopped` (ended early), `interrupted` (the program died), `recorder_failed`; suffixed `-no-result` if too few blocks completed for a test |
+| `feedback` | What the participant saw: `trace`, `wave`, `text` (headless) or `none` (sham) |
 | `config_hash` | Identifies the exact protocol and analysis version |
 
 ### Live feedback (display only)
 
 The GUI shows the session's own measure on the current block:
 
-- **Intention:** the z of the block's proportion of 1s, compared with the lean estimated from REST blocks so far. It is signed by the aim, so positive always means "the way you are aiming".
+- **Intention:** the z of the block's proportion of 1s, compared with the lean estimated from REST blocks so far (before the first REST block: all other data so far, never the block being shown). The number at bottom right is the trace's current height divided by √reads, so up is positive. The tally circles and colours are signed by the aim, so they always mean "the way you are aiming".
 - **Connection:** the sum of `z1*z2` over the block divided by √(reads in the block).
 
 Live feedback is not the result. The confirmatory p comes from the permutation test after the session.
@@ -194,6 +211,8 @@ Code layout: `dualrng/recorder.py` (acquisition), `sources.py` (hardware and sim
 
 The recorder is a separate process. It reads the device continuously, with no sleeps and no mode switching, and appends every read to `reads.bin`. Each write is flushed immediately and fsynced every second. The GUI, live feedback and analysis only read that file, so none of them can stall acquisition. If the main program dies, the recorder notices within a second, releases the serial port and exits.
 
+**One clock for both processes.** Block times are written by the main program, and read timestamps by the recorder, so the two must read the same clock. Both use `dualrng/clock.py`, the system-wide monotonic clock (`clock_gettime(CLOCK_MONOTONIC)`). Python's `time.monotonic()` is not safe here: on at least one macOS Python build, a spawned process's `time.monotonic()` disagreed with its parent's by seconds, which put reads in the wrong blocks. At every session start, the recorder reports its clock reading and the session refuses to start if the two processes disagree by more than half a second. The measured offset is saved in `meta.json` (`recorder_clock_offset_s`).
+
 ---
 
 ## Hardware
@@ -228,8 +247,6 @@ The recorder is a separate process. It reads the device continuously, with no sl
 - The connection z scaling uses the empirical mean and SD of REST reads, not the binomial SD, so any excess hardware variance is handled.
 - The old baseline collection is replaced by sham sessions. Sham sessions are the control for everything in the pipeline, not just the generators.
 
-**One clock for both processes.** Block times are written by the main program, and read timestamps by the recorder, so the two must read the same clock. Both use `dualrng/clock.py`, the system-wide monotonic clock (`clock_gettime(CLOCK_MONOTONIC)`). Python's `time.monotonic()` is not safe here: on at least one macOS Python build, a spawned process's `time.monotonic()` disagreed with its parent's by seconds, which put reads in the wrong blocks. At every session start, the recorder reports its clock reading and the session refuses to start if the two processes disagree by more than half a second. The measured offset is saved in `meta.json` (`recorder_clock_offset_s`).
-
 ---
 
 ## Validation
@@ -241,7 +258,13 @@ The recorder is a separate process. It reads the device continuously, with no sl
 - **Exact enumeration and Monte Carlo agree**, the ledger z round-trips to the session p, and stopped sessions use only completed blocks.
 - **The exploratory scan** is calibrated under the null (rejection rate within binomial limits), stays calibrated when the generators have a steady coupling like this unit's, and locates an injected local burst.
 - **Acquisition:** RAW_BIN parsing, including chunking, garbage bytes and a dropped byte. Also the file format, including a truncated last record, and the recorder process.
-- **End to end:** a headless session; the real GUI loop driven by taps (the Stop button, and closing the window mid-session) produces a finalized session and a ledger row; a session killed with SIGKILL is recovered on the next start.
+- **End to end:**
+  - A headless session completes and is saved.
+  - A strong injected HIGH/LOW effect, run through the real recorder process, shows up in the right blocks with the right sign.
+  - The recorder's timestamps match the main program's clock, including for a recorder started after an earlier one.
+  - The real GUI loop, driven by taps, produces a finalized session and a ledger row when you tap Stop and when you close the window mid-session.
+  - An intention session with the trace display draws the trace during aimed blocks and records `feedback: trace`.
+  - A session killed with SIGKILL is recovered on the next start.
 
 The simulator draws bits with `p(1) = lean ± δ` for intention effects. It adds a shared random shift to both generators' p(1) to give a stated correlation `rho` between their per-read z scores. Use `--sim-delta` and `--sim-rho` to see what an effect of a given size looks like in the GUI and report.
 

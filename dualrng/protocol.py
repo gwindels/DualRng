@@ -49,6 +49,19 @@ DEFAULT_TAIL = {
 
 DEFAULT_BLOCKS_PER_LABEL = {"intention": 8, "connection": 12}
 
+# What the participant sees during blocks. Part of the protocol (and its hash),
+# so sessions run with different displays are never pooled unknowingly.
+#   trace  cumulative deviation line for the current block, with the aimed
+#          direction and a chance envelope (intention only)
+#   wave   the sine-wave visual, calmer and brighter as the block goes the
+#          intended way
+#   text   headless runs: cues and block z printed in a terminal
+FEEDBACK_CHOICES = {
+    "intention": ("trace", "wave", "text"),
+    "connection": ("wave", "text"),
+}
+DEFAULT_FEEDBACK = {"intention": "trace", "connection": "wave"}
+
 
 @dataclass
 class ProtocolConfig:
@@ -59,6 +72,7 @@ class ProtocolConfig:
     blocks_per_label: int = 0          # 0 = default for the session type
     bits_per_read: int = 1024
     tail: str = ""                     # "" = default for the session type
+    feedback: str = ""                 # "" = default display for the session type
     n_permutations: int = 20000        # used when exact enumeration is too large
     exact_limit: int = 200000          # enumerate all label assignments up to this many
     scan_windows_seconds: tuple = (5, 10, 20, 40, 80, 160)
@@ -72,6 +86,11 @@ class ProtocolConfig:
             self.blocks_per_label = DEFAULT_BLOCKS_PER_LABEL[self.session_type]
         if not self.tail:
             self.tail = DEFAULT_TAIL[self.session_type]
+        if not self.feedback:
+            self.feedback = DEFAULT_FEEDBACK[self.session_type]
+        if self.feedback not in FEEDBACK_CHOICES[self.session_type]:
+            raise ValueError(f"feedback for {self.session_type} must be one of "
+                             f"{FEEDBACK_CHOICES[self.session_type]}")
         if self.tail not in ("greater", "less", "two-sided"):
             raise ValueError("tail must be greater, less or two-sided")
         if self.blocks_per_label < 2:
