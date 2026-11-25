@@ -228,6 +228,8 @@ The recorder is a separate process. It reads the device continuously, with no sl
 - The connection z scaling uses the empirical mean and SD of REST reads, not the binomial SD, so any excess hardware variance is handled.
 - The old baseline collection is replaced by sham sessions. Sham sessions are the control for everything in the pipeline, not just the generators.
 
+**One clock for both processes.** Block times are written by the main program, and read timestamps by the recorder, so the two must read the same clock. Both use `dualrng/clock.py`, the system-wide monotonic clock (`clock_gettime(CLOCK_MONOTONIC)`). Python's `time.monotonic()` is not safe here: on at least one macOS Python build, a spawned process's `time.monotonic()` disagreed with its parent's by seconds, which put reads in the wrong blocks. At every session start, the recorder reports its clock reading and the session refuses to start if the two processes disagree by more than half a second. The measured offset is saved in `meta.json` (`recorder_clock_offset_s`).
+
 ---
 
 ## Validation

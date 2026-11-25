@@ -26,6 +26,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 from dualrng.analysis import finalize_pending, finalize_session, read_json, summarize  # noqa: E402
+from dualrng import clock  # noqa: E402
 from dualrng.live import LiveFeedback  # noqa: E402
 from dualrng.protocol import ProtocolConfig  # noqa: E402
 from dualrng.session import SessionRunner  # noqa: E402
@@ -134,7 +135,7 @@ class Controller:
         r = self.runner
         if self.gui.mode != "session" or r is None:
             return
-        now = time.monotonic()
+        now = clock.now()
         if now - self._last_poll > 0.25:
             self.live.poll()
             self._last_poll = now

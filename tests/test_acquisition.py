@@ -108,3 +108,29 @@ def test_probe_descriptions_on_synthetic_captures():
     ascii_stream = (",".join(str(v) for v in vals) + ",").encode()
     text = "\n".join(describe_unwhitened(ascii_stream))
     assert "even-position mean" in text and "contains '-' signs: False" in text
+
+
+def test_recorder_timestamps_use_the_parents_clock(tmp_path):
+    """Read timestamps come from the recorder process and block times from the
+    main process; they must be on one clock. (time.monotonic() is not shared
+    between processes on some macOS builds, which put reads seconds late.)"""
+    from dualrng import clock
+
+    # The faulty clock only showed up for processes spawned after the first, so
+    # start one recorder, wait, and check a second one (as the GUI does).
+    first = Recorder(str(tmp_path / "a"), {"kind": "sim", "reads_per_second": 50}, 256)
+    os.makedirs(tmp_path / "a")
+    first.start()
+    first.stop()
+    time.sleep(1.5)
+    os.makedirs(tmp_path / "b")
+    rec = Recorder(str(tmp_path / "b"), {"kind": "sim", "reads_per_second": 118, "seed": 4}, 1024)
+    rec.start()
+    assert rec.clock_offset is not None and -0.05 <= rec.clock_offset < 0.5
+    lags = []
+    for _ in range(5):
+        time.sleep(0.3)
+        recs = load_records(str(tmp_path / "b" / "reads.bin"))
+        lags.append(clock.now() - float(recs["t_end"].max()))
+    rec.stop()
+    assert max(lags) < 0.25, lags   # the newest read is current, not seconds old

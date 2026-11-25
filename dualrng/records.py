@@ -4,8 +4,8 @@ reads.bin is an append-only binary file:
 
     header  16 bytes   b"DUALRNG1" | uint32 bits_per_read | uint32 format version
     records fixed size, one per generator per read:
-        t_start  float64   time.monotonic() before the read began
-        t_end    float64   time.monotonic() when the read completed
+        t_start  float64   dualrng.clock.now() before the read began
+        t_end    float64   dualrng.clock.now() when the read completed
         seq      uint32    read number; both generators of one read share it
         gen      uint8     1 or 2
         (pad)    3 bytes

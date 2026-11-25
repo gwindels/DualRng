@@ -48,6 +48,26 @@ def test_headless_complete_session(tmp_path):
     assert "p_scan" not in open(os.path.join(tmp_path, "ledger.csv")).read()
 
 
+def test_injected_effect_lands_in_the_right_blocks(tmp_path):
+    """Through the real recorder process: a strong HIGH/LOW effect must show up
+    with the right sign. This only works if reads are assigned to the blocks
+    they were recorded in."""
+    out = subprocess.run([sys.executable, os.path.join(ROOT, "app.py"), "--base-dir", str(tmp_path),
+                          "run", "--type", "intention", "--source", "sim", "--block-seconds", "1.5",
+                          "--gap-seconds", "0.3", "--blocks-per-label", "3", "--sim-rate", "118",
+                          "--sim-delta", "0.01"],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    res = json.load(open(os.path.join(only_session(tmp_path), "results.json")))
+    p = res["primary"]
+    assert p["p_high"] - p["p_low"] > 0.015          # injected difference is 0.02
+    assert p["p"] == pytest.approx(1 / 20)          # the most extreme of the 20 assignments
+    for b in res["blocks"]:
+        if b["label"] in ("HIGH", "LOW") and b["used"]:
+            dev = (b["p1"] + b["p2"]) / 2 - p["lean"]["pooled"]
+            assert dev > 0 if b["label"] == "HIGH" else dev < 0, b
+
+
 def test_killed_session_is_recovered_on_next_start(tmp_path):
     proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "app.py"), "--base-dir", str(tmp_path),
                              "run", "--type", "intention", "--block-seconds", "2", "--gap-seconds", "0.2",
